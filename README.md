@@ -14,7 +14,7 @@ machine except the requests you make to the AI provider you chose.
 ### Option 1 — from a `.vsix` file (easiest)
 
 1. Download `infinity-coder-<version>.vsix` from the
-   [Releases page](https://github.com/CHANGE-ME/infinity-coder/releases).
+   [Releases page](https://github.com/UtkarshloneyaITG/Infinity-Coder/releases).
 2. Install it:
 
    **From the VS Code UI**
@@ -33,8 +33,8 @@ machine except the requests you make to the AI provider you chose.
 ### Option 2 — build it yourself
 
 ```bash
-git clone https://github.com/CHANGE-ME/infinity-coder.git
-cd infinity-coder
+git clone https://github.com/UtkarshloneyaITG/Infinity-Coder.git
+cd Infinity-Coder
 npm install
 npm run package          # produces the .vsix in this folder
 code --install-extension infinity-coder-0.1.0.vsix
@@ -43,8 +43,8 @@ code --install-extension infinity-coder-0.1.0.vsix
 ### Option 3 — run from source (for hacking on it)
 
 ```bash
-git clone https://github.com/CHANGE-ME/infinity-coder.git
-cd infinity-coder
+git clone https://github.com/UtkarshloneyaITG/Infinity-Coder.git
+cd Infinity-Coder
 npm install
 npm run compile
 ```

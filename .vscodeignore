@@ -1,0 +1,15 @@
+# Everything here is excluded from the published .vsix.
+.vscode/**
+.vscode-test/**
+.github/**
+src/**
+tsconfig.json
+package-lock.json
+*.vsix
+
+# Source maps point at src/, which is not shipped — so they are dead weight.
+**/*.map
+
+# Self-checks are for development, not for users.
+out/*.test.js
+out/**/*.test.js
