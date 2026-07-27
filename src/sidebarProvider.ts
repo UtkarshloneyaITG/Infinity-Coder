@@ -4,12 +4,15 @@ import * as fs from 'fs';
 import { ChatMessage, MessageBlock, ModelInfo, ToolInfo } from './types';
 import { SessionManager, ChatSession } from './sessionManager';
 import type { SemanticIndexManager } from './semantic/indexManager';
-import { SettingsStore, testKey, TOOL_GROUP_LABELS } from './settings';
-import { MODELS } from './catalog';
+import { SettingsStore, testKey, testModel, TOOL_GROUP_LABELS } from './settings';
+import { availableModels } from './catalog';
 import { Engine, Msg, NoCredentialsError, trimHistory } from './engine/agent';
 import { ALL_TOOLS } from './engine/tools';
 import { rebuildEngineHistory } from './engine/history';
 import { SkillRegistry, selectSkills, loadSkillBodies } from './engine/skills';
+import { createOrchestration, Orchestration } from './brains';
+import { changeSetStat } from './brains/executor';
+import { OrchestratorEvent } from './brains/types';
 
 /** Stamp an approval block with its outcome. */
 function markApproval(
@@ -42,6 +45,12 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
   private discoveredModels = new Map<string, string[]>();
   /** Set once activation builds it. Absent means semantic retrieval is off. */
   private semantic?: SemanticIndexManager;
+  /**
+   * The multi-brain layer. Built on first use rather than at construction: it
+   * needs the workspace root, and it costs nothing to anyone who never turns
+   * Team mode on.
+   */
+  private orchestrationInstance?: Orchestration;
 
   /** Shared with the index manager so both read one settings store. */
   public get settingsStore(): SettingsStore { return this.settings; }
@@ -105,11 +114,16 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     // Sent up front, not just when Settings opens: the slash menu is built from
     // this, so /<skill> has to work on the first message.
     this.sendSkillsToWebview();
+    // Likewise — the Team toggle only exists when team mode is enabled, and the
+    // input has no way to know that until the settings arrive.
+    this.sendSettingsToWebview();
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
         case 'sendMessage': {
-          await this.handleUserMessage(data.text, data.model, data.attachments, data.skills, data.planMode);
+          await this.handleUserMessage(
+            data.text, data.model, data.attachments, data.skills, data.planMode, data.teamMode
+          );
           break;
         }
         case 'searchFiles': {
@@ -122,6 +136,10 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
             all: data.choice === 'applyAll',
             feedback: (data.feedback || '').trim() || undefined,
           });
+          break;
+        }
+        case 'testModel': {
+          await this.handleTestModel(data.modelId, data.providerId);
           break;
         }
         case 'indexCommand': {
@@ -493,24 +511,18 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     const settings = this.settings.get();
     const ready = settings.providers.some(p => p.enabled && p.keys.length > 0);
 
-    // The static catalog, plus any model a successful key Test discovered.
-    const seen = new Set<string>();
-    const models: ModelInfo[] = [];
-    for (const m of MODELS) {
-      seen.add(m.id);
-      models.push({
-        id: m.id, name: m.name, provider: m.publisher,
-        tier: m.tier, tools: m.tools, contextWindow: 0,
-      });
-    }
-    for (const [providerId, ids] of this.discoveredModels) {
-      for (const id of ids) {
-        if (!seen.has(id)) {
-          seen.add(id);
-          models.push({ id, name: id, provider: providerId, tier: 'medium', tools: true, contextWindow: 0 });
-        }
-      }
-    }
+    // Only models the user can actually reach. A provider with no key
+    // contributes none of its models, so the dropdown never offers something
+    // that fails on send with a credentials error.
+    const reachable = availableModels(
+      settings.providers, this.discoveredModels, settings.customModels, settings.hiddenModels,
+    ).filter(m => !m.hidden);
+    const seen = new Set(reachable.map(m => m.id));
+    const models: ModelInfo[] = reachable.map(m => ({
+      id: m.id, name: m.name, provider: m.provider,
+      tier: m.tier, tools: m.tools, contextWindow: 0,
+    }));
+
     // The active model may be a hand-typed id not in either list — show it anyway,
     // or the dropdown would silently select something the engine isn't using.
     if (settings.activeModel && !seen.has(settings.activeModel)) {
@@ -587,12 +599,239 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     return history;
   }
 
+  /** Built on first use — it needs a workspace root, which may arrive late. */
+  private get orchestration(): Orchestration {
+    if (!this.orchestrationInstance) {
+      this.orchestrationInstance = createOrchestration({
+        context: this.context,
+        settings: this.settings,
+        engine: this.engine,
+        workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '',
+        isTrusted: vscode.workspace.isTrusted,
+      });
+    }
+    return this.orchestrationInstance;
+  }
+
+  /** Entry point for the Run AI Team command. Same path as the Team toggle. */
+  public async sendTeamPrompt(text: string): Promise<void> {
+    if (!this.orchestration.store.get().enabled) {
+      // Otherwise "disabled" would only mean "the button is hidden", and the
+      // command would still spend a team run's worth of tokens.
+      const choice = await vscode.window.showWarningMessage(
+        'Team mode is off. Enable it in Settings → Brains?',
+        'Enable and run',
+        'Cancel'
+      );
+      if (choice !== 'Enable and run') {
+        return;
+      }
+      await this.orchestration.store.patch({ enabled: true });
+      this.sendSettingsToWebview();
+    }
+    await this.handleUserMessage(text, undefined, undefined, undefined, false, true);
+  }
+
+  /**
+   * Team mode: run the brain team instead of a single agent, rendering into the
+   * SAME assistant message the normal turn uses.
+   *
+   * Deliberately no separate panel. Each task becomes a tool block, so progress
+   * reads the way tool calls already do, and the change set goes through the
+   * existing inline approval cards — one approval UI in this extension, not two.
+   */
+  private async runTeam(userText: string, assistantMsgId: string): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const msgOf = () => this.currentSession.messages.find(m => m.id === assistantMsgId);
+
+    const append = (text: string) => {
+      const msg = msgOf();
+      if (!msg) {
+        return;
+      }
+      msg.content += text;
+      msg.blocks = msg.blocks || [];
+      msg.blocks.push({ type: 'text', text });
+    };
+    const notice = (text: string) => {
+      const msg = msgOf();
+      if (msg) {
+        msg.notices = msg.notices || [];
+        msg.notices.push(text);
+      }
+    };
+
+    if (!root) {
+      append('Team mode needs an open project folder — the brains work on files.');
+      this.flushStreamUpdate();
+      return;
+    }
+
+    // Held locally: stopCurrentGeneration() nulls the field the moment Stop is
+    // pressed, and this method still needs the signal afterwards to unwind.
+    const controller = this.activeAbortController!;
+    const brainName = (id: string) => this.orchestration.registry.get(id)?.name || id;
+    /** taskId -> the tool block standing in for that task. */
+    const taskBlocks = new Map<string, MessageBlock>();
+    /** taskId -> task, filled by the plan event so status updates can be labelled. */
+    const planTasks = new Map<string, { title: string; instruction: string }>();
+
+    const onEvent = (event: OrchestratorEvent) => {
+      const msg = msgOf();
+      if (!msg) {
+        return;
+      }
+      msg.blocks = msg.blocks || [];
+
+      switch (event.type) {
+        case 'plan': {
+          for (const t of event.plan.tasks) {
+            planTasks.set(t.id, { title: t.title, instruction: t.instruction });
+          }
+          const lines = event.plan.tasks.map(t => {
+            const deps = t.dependsOn.length ? ` _(after ${t.dependsOn.join(', ')})_` : '';
+            return `- **${brainName(t.brainId)}** — ${t.title}${deps}`;
+          });
+          append(`**Plan** — ${event.plan.tasks.length} task(s)\n\n${lines.join('\n')}\n\n`);
+          break;
+        }
+        case 'task-state': {
+          const status = event.status;
+          const task = planTasks.get(status.taskId);
+          const label = `${brainName(status.brainId)} · ${task?.title || status.taskId}`;
+
+          let block = taskBlocks.get(status.taskId);
+          if (!block) {
+            block = { type: 'tool', name: label, input: { task: task?.instruction || '' }, done: false };
+            taskBlocks.set(status.taskId, block);
+            msg.blocks.push(block);
+          }
+          if (status.state !== 'running' && status.state !== 'pending') {
+            const bits: string[] = [status.state];
+            if (status.model) {
+              bits.push(status.model);
+            }
+            if (status.costUsd) {
+              bits.push(`$${status.costUsd.toFixed(4)}`);
+            }
+            if (typeof status.confidence === 'number') {
+              bits.push(`confidence ${status.confidence.toFixed(2)}`);
+            }
+            block.result = [bits.join(' · '), status.note || ''].filter(Boolean).join('\n');
+            block.done = true;
+          }
+          break;
+        }
+        case 'proposal': {
+          const block = taskBlocks.get(event.proposal.taskId);
+          if (block && event.proposal.summary) {
+            block.result = `${block.result ? block.result + '\n' : ''}${event.proposal.summary}`;
+          }
+          break;
+        }
+        case 'consensus':
+          notice(`Consensus: ${event.result.rationale}`);
+          break;
+        case 'conflict':
+          notice(`Conflict (${event.conflict.resolution}) — ${event.conflict.detail}`);
+          break;
+      }
+      this.scheduleStreamUpdate();
+    };
+
+    const run = await this.orchestration.orchestrator.run({
+      goal: userText,
+      workspaceRoot: root,
+      logDir: path.join(this.context.globalStorageUri.fsPath, 'procs'),
+      isTrusted: vscode.workspace.isTrusted,
+      signal: controller.signal,
+      onEvent,
+    });
+
+    if (run.state === 'failed') {
+      append(`\nThe run failed: ${run.error}`);
+      this.flushStreamUpdate();
+      return;
+    }
+
+    const cancelled = run.state === 'cancelled';
+
+    if (run.changes.length === 0) {
+      append(
+        cancelled
+          ? '\nStopped. Nothing was written, and no brain had staged a change yet.'
+          : '\nThe team finished without proposing any file changes.'
+      );
+      this.flushStreamUpdate();
+      return;
+    }
+
+    // The change set goes through the same inline approval cards a normal turn
+    // uses, so "Apply All" behaves identically here.
+    const stat = changeSetStat(run.changes);
+    append(
+      `\n**Change set** — ${stat.files} file(s), +${stat.added} / −${stat.removed}, ` +
+        `$${run.totalCostUsd.toFixed(4)} across ${run.proposals.length} brain turn(s).\n\n`
+    );
+
+    if (cancelled) {
+      const finished = run.statuses.filter(s => s.state === 'done').length;
+      append(
+        `Stopped after ${finished} of ${run.statuses.length} task(s). Nothing has been ` +
+          `written. What the finished brains staged is offered below, but it is a **partial** ` +
+          `result — the reviewer never ran, and half a change set can be worse than none ` +
+          `(a migration written without the code that uses it). Reject if in doubt and re-run.\n\n`
+      );
+    }
+    this.flushStreamUpdate();
+
+    // 'applied' already means the policy auto-applied it inside run().
+    if (run.state === 'applied') {
+      append('Applied automatically — your approval policy is set to skip review.\n');
+      this.flushStreamUpdate();
+      return;
+    }
+
+    let approveAll = false;
+    // A partial set is never applied unattended: the user stopped the run, so
+    // auto-approve is not consent for what it happened to have finished.
+    const approver = this.settings.get().approvalMode === 'auto' && !cancelled
+      ? undefined
+      : async (change: { kind: 'write' | 'edit' | 'delete'; path: string; before: string | null; after: string | null }) => {
+          if (approveAll) {
+            return { approved: true };
+          }
+          const verdict = await this.askApproval(
+            { kind: change.kind, path: change.path, before: change.before, after: change.after },
+            assistantMsgId
+          );
+          if (verdict.all) {
+            approveAll = true;
+          }
+          return { approved: verdict.approved, feedback: verdict.feedback };
+        };
+
+    // A fresh controller: after a stop the original signal is already aborted,
+    // and the Executor skips every file on an aborted signal — so reusing it
+    // would silently apply nothing. This also keeps Stop working during the
+    // approval prompts.
+    const applyController = new AbortController();
+    this.activeAbortController = applyController;
+    await this.orchestration.orchestrator.apply(
+      run,
+      { onEvent, signal: applyController.signal },
+      approver
+    );
+    this.flushStreamUpdate();
+  }
+
   private async handleUserMessage(
     userText: string,
     modelOverride?: string,
     attachments?: string[],
     forcedSkills?: string[],
-    planMode?: boolean
+    planMode?: boolean,
+    teamMode?: boolean
   ) {
     const userMsgId = `user-${Date.now()}`;
     const assistantMsgId = `asst-${Date.now()}`;
@@ -675,6 +914,32 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       }
       return { approved: result.approved, feedback: result.feedback };
     };
+
+    // Team mode replaces the single-agent turn entirely. It takes the RAW user
+    // text: the planner works from the goal, and each brain builds its own
+    // context from its own rules, so the injected workspace header would only
+    // duplicate that — badly, and for every brain.
+    if (teamMode) {
+      try {
+        await this.runTeam(userText, assistantMsgId);
+      } catch (err: any) {
+        const msg = this.currentSession.messages.find(m => m.id === assistantMsgId);
+        if (msg && err?.name !== 'AbortError') {
+          msg.error = true;
+          msg.content += `\n\nError: ${err?.message || err}`;
+          msg.blocks = msg.blocks || [];
+          msg.blocks.push({ type: 'text', text: `\n\nError: ${err?.message || err}` });
+        }
+      } finally {
+        const msg = this.currentSession.messages.find(m => m.id === assistantMsgId);
+        if (msg) {
+          msg.streaming = false;
+        }
+        this.activeAbortController = null;
+        this.flushStreamUpdate();
+      }
+      return;
+    }
 
     try {
       const answer = await this.engine.chat({
@@ -1085,12 +1350,43 @@ ${built.text}`;
         case 'save':
           await store.patch(data.patch);
           break;
+        case 'toggleHideModel': {
+          const id = String(data.modelId || '');
+          const hidden = store.get().hiddenModels;
+          await store.patch({
+            hiddenModels: hidden.includes(id) ? hidden.filter(m => m !== id) : [...hidden, id],
+          });
+          break;
+        }
+        case 'addCustomModel': {
+          const id = String(data.modelId || '').trim();
+          const current = store.get().customModels;
+          // Silently ignoring a duplicate is friendlier than an error dialog for
+          // something this trivial, but it must not create a second row.
+          if (id && !current.includes(id)) {
+            await store.patch({ customModels: [...current, id] });
+          }
+          break;
+        }
+        case 'removeCustomModel': {
+          const id = String(data.modelId || '');
+          await store.patch({ customModels: store.get().customModels.filter(m => m !== id) });
+          break;
+        }
         case 'addKey':
           await store.addKey(data.providerId, data.key);
+          // Learn this provider's models straight away, so the dropdown fills
+          // in without the user having to also press Test.
+          void this.discoverModels(true);
           break;
         case 'removeKey':
           if (await this.confirmDestructive('Delete this API key?')) {
             await store.removeKey(data.providerId, data.keyId);
+            // Losing the last key makes that provider's models unreachable, so
+            // the cached discovery has to go with it.
+            if (!this.hasKeyFor(data.providerId)) {
+              this.discoveredModels.delete(data.providerId);
+            }
           }
           break;
         case 'moveKey':
@@ -1147,6 +1443,44 @@ ${built.text}`;
         case 'openSkillFile':
           await this.openFileInEditor(data.file);
           break;
+
+        // ── Brains ────────────────────────────────────────────────────────
+        case 'saveOrchestration':
+          await this.orchestration.store.patch(data.patch);
+          this.orchestration.registry.reload();
+          break;
+        case 'setBrainOverride':
+          await this.orchestration.store.setBrainOverride(data.id, data.override);
+          this.orchestration.registry.reload();
+          break;
+        case 'resetBrain':
+          await this.orchestration.store.setBrainOverride(data.id, {});
+          this.orchestration.registry.reload();
+          break;
+        case 'reloadBrains':
+          this.orchestration.registry.reload();
+          break;
+        case 'addBrainRoot': {
+          const picked = await vscode.window.showOpenDialog({
+            canSelectFolders: true,
+            canSelectFiles: false,
+            canSelectMany: false,
+            title: 'Choose a folder containing brain packs',
+            openLabel: 'Add brain folder',
+          });
+          if (picked && picked[0]) {
+            const roots = [...this.orchestration.store.get().brainRoots, picked[0].fsPath];
+            await this.orchestration.store.patch({ brainRoots: roots });
+            this.orchestration.registry.reload();
+          }
+          break;
+        }
+        case 'removeBrainRoot': {
+          const roots = this.orchestration.store.get().brainRoots.filter((r: string) => r !== data.root);
+          await this.orchestration.store.patch({ brainRoots: roots });
+          this.orchestration.registry.reload();
+          break;
+        }
       }
     } catch (e: any) {
       vscode.window.showErrorMessage(`Infinity Coder settings: ${e.message}`);
@@ -1155,6 +1489,82 @@ ${built.text}`;
     this.sendSkillsToWebview();
     // Keys, model and tool toggles all feed the header state, so refresh it too.
     this.refreshBackendState();
+  }
+
+  /** Whether this provider is enabled and has at least one key stored. */
+  private hasKeyFor(providerId: string): boolean {
+    const provider = this.settings.get().providers.find(p => p.id === providerId);
+    return !!provider && provider.enabled && provider.keys.length > 0;
+  }
+
+  /**
+   * Ask every keyed provider what it serves.
+   *
+   * Without this the model list for anything but NVIDIA stayed empty until the
+   * user happened to press Test — so a Groq key looked like it had no models.
+   * Failures are silent: an unreachable provider should narrow the dropdown,
+   * not raise an error on a chat the user has not started yet.
+   */
+  public async discoverModels(force = false): Promise<void> {
+    for (const provider of this.settings.get().providers) {
+      if (!provider.enabled || provider.keys.length === 0) {
+        continue;
+      }
+      if (!force && this.discoveredModels.has(provider.id)) {
+        continue;
+      }
+      for (const meta of provider.keys) {
+        const raw = await this.settings.getKey(meta.id);
+        if (!raw) {
+          continue;
+        }
+        const result = await testKey(provider.baseUrl, raw);
+        if (result.ok && result.models.length > 0) {
+          this.discoveredModels.set(provider.id, result.models);
+          break; // one working key is enough to learn the catalogue
+        }
+      }
+    }
+    this.refreshBackendState();
+    this.sendSettingsToWebview();
+  }
+
+  /**
+   * Try one real completion for a model against a chosen provider.
+   *
+   * The answer people actually want is "will this work when I hit send", and
+   * only a real call answers it — a provider can list a model the account has no
+   * entitlement for.
+   */
+  private async handleTestModel(modelId: string, providerId: string) {
+    const say = (ok: boolean, message: string) =>
+      this.postToWebview({ type: 'modelTestResult', modelId, providerId, ok, message });
+
+    const id = (modelId || '').trim();
+    if (!id) {
+      say(false, 'Pick or type a model first');
+      return;
+    }
+    const provider = this.settings.get().providers.find(p => p.id === providerId);
+    if (!provider) {
+      say(false, 'Pick a provider');
+      return;
+    }
+    if (provider.keys.length === 0) {
+      say(false, `${provider.name} has no key — add one under Keys`);
+      return;
+    }
+
+    // The first key that exists, matching what the engine would reach for.
+    for (const meta of provider.keys) {
+      const raw = await this.settings.getKey(meta.id);
+      if (raw) {
+        const result = await testModel(provider.baseUrl, raw, id);
+        say(result.ok, result.message);
+        return;
+      }
+    }
+    say(false, 'No usable key in the keychain');
   }
 
   private async handleTestKey(providerId: string, keyId: string) {
@@ -1170,6 +1580,9 @@ ${built.text}`;
 
     if (result.ok && result.models.length > 0) {
       this.discoveredModels.set(providerId, result.models);
+      // A newly working key changes which models are reachable, so both the
+      // composer dropdown and the Models tab have to be re-derived.
+      this.refreshBackendState();
     }
     this.postToWebview({
       type: 'settingsTestResult',
@@ -1210,9 +1623,31 @@ ${built.text}`;
     this.postToWebview({
       type: 'settingsUpdate',
       settings: this.settings.get(),
-      catalog: MODELS,
-      discovered: Object.fromEntries(this.discoveredModels),
+      // Exactly what the composer dropdown offers — one reachability rule, not
+      // two that can drift. Each entry says which provider serves it, since the
+      // same id can come from more than one.
+      catalog: availableModels(
+        this.settings.get().providers, this.discoveredModels,
+        this.settings.get().customModels, this.settings.get().hiddenModels,
+      ),
       toolGroupLabels: TOOL_GROUP_LABELS,
+      orchestration: this.orchestration.store.get(),
+      brains: this.orchestration.registry.all().map(b => ({
+        id: b.id,
+        name: b.name,
+        role: b.role,
+        description: b.description,
+        model: b.model || '',
+        provider: b.provider || '',
+        temperature: b.temperature,
+        priority: b.priority,
+        enabled: b.enabled,
+        source: b.source,
+        tools: b.tools,
+        scope: b.contextRules.include,
+        contextMode: b.contextRules.mode,
+      })),
+      brainProblems: this.orchestration.registry.getProblems(),
     });
   }
 
@@ -1472,33 +1907,153 @@ ${built.text}`;
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
-      padding: 24px;
+      /* "safe" matters: a plain centred flex column clips its own top once the
+         content is taller than a short panel, and the scrollbar cannot reach it. */
+      justify-content: safe center;
+      padding: 28px 20px;
       text-align: center;
-      gap: 16px;
+      gap: 0;
+      /* The panel is often narrow; nothing here may force a horizontal scroll. */
+      min-width: 0;
+      overflow-y: auto;
+    }
+
+    /* The mark: the extension's own braces-and-infinity icon, in a soft ring. */
+    .landing-mark {
+      position: relative;
+      width: 84px;
+      height: 84px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background:
+        radial-gradient(circle at 50% 45%, rgba(78, 201, 176, 0.14), transparent 68%),
+        var(--card-bg);
+      animation: landing-float 6s ease-in-out infinite;
+    }
+
+    /* The glow, on its own layer so it can pulse without moving the icon. */
+    .landing-mark::before {
+      content: '';
+      position: absolute;
+      inset: -14px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(78, 201, 176, 0.16), transparent 70%);
+      animation: landing-glow 4s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .landing-mark svg {
+      width: 46px;
+      height: 46px;
+      color: var(--accent-strong);
+      position: relative;
+    }
+
+    @keyframes landing-float {
+      0%, 100% { transform: translateY(0); }
+      50%      { transform: translateY(-5px); }
+    }
+    @keyframes landing-glow {
+      0%, 100% { opacity: .55; }
+      50%      { opacity: 1; }
+    }
+
+    /* Motion here is decoration. Anyone who has asked for less of it gets none. */
+    @media (prefers-reduced-motion: reduce) {
+      .landing-mark, .landing-mark::before { animation: none; }
     }
 
     .landing-brand {
-      font-size: 1.25rem;
+      margin-top: 16px;
+      font-size: 1.3rem;
       font-weight: 700;
-      color: var(--accent-strong);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .landing-art {
-      width: 48px;
-      height: 48px;
-      color: var(--accent);
-      opacity: 0.9;
+      letter-spacing: -0.01em;
+      color: var(--heading-color);
     }
 
     .landing-info {
+      margin-top: 6px;
       font-size: 0.82rem;
       color: var(--text-dim);
-      max-width: 280px;
-      line-height: 1.5;
+      max-width: 290px;
+      line-height: 1.55;
+    }
+
+    .landing-chips {
+      margin-top: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      width: 100%;
+      max-width: 300px;
+    }
+
+    .landing-chip {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      width: 100%;
+      padding: 9px 11px;
+      text-align: left;
+      font-family: inherit;
+      font-size: 0.8rem;
+      color: var(--text);
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s, transform .15s;
+    }
+
+    .landing-chip:hover {
+      background: var(--hover-bg);
+      border-color: var(--accent-strong);
+      transform: translateX(2px);
+    }
+
+    .landing-chip:focus-visible {
+      outline: 1px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    .landing-chip svg {
+      width: 15px;
+      height: 15px;
+      flex: 0 0 auto;
+      color: var(--accent-strong);
+      opacity: .85;
+    }
+
+    .landing-chip span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .landing-hints {
+      margin-top: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 6px 10px;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+    }
+
+    .landing-hints kbd {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.7rem;
+      padding: 1px 5px;
+      margin-right: 3px;
+      color: var(--text);
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
     }
 
     /* Message Thread Spacing */
@@ -2278,22 +2833,7 @@ ${built.text}`;
       flex-shrink: 0;
     }
 
-    .stream-status-stop {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text-dim);
-      border-radius: 4px;
-      padding: 2px 7px;
-      font-size: 0.65rem;
-      cursor: pointer;
-      font-family: inherit;
-      flex-shrink: 0;
-    }
 
-    .stream-status-stop:hover {
-      color: var(--danger);
-      border-color: var(--danger);
-    }
 
     /* Three dots that keep moving, so a long silent tool call still looks alive */
     .stream-status-dots {
@@ -2631,7 +3171,141 @@ ${built.text}`;
       line-height: 1.4;
     }
 
-    .check-row input { margin-top: 2px; flex-shrink: 0; }
+    .check-row:hover { color: var(--heading-color); }
+
+    .model-catalog {
+      max-height: 190px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--input-bg);
+    }
+
+    .model-catalog:empty::after {
+      content: 'No models — add a provider key under Keys.';
+      display: block;
+      padding: 10px;
+      font-size: 0.68rem;
+      color: var(--text-dim);
+    }
+
+    .model-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 8px;
+      font-size: 0.68rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .model-row:last-child { border-bottom: none; }
+    .model-row:hover { background: var(--hover-bg); }
+
+    .model-row .id {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--vscode-editor-font-family, monospace);
+      color: var(--text);
+    }
+
+    .model-row .who {
+      flex-shrink: 0;
+      color: var(--text-dim);
+      font-size: 0.64rem;
+    }
+
+    .model-row .use {
+      flex-shrink: 0;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--text-dim);
+      font-size: 0.62rem;
+      font-family: inherit;
+      padding: 1px 6px;
+      cursor: pointer;
+    }
+
+    .model-row .use:hover { color: var(--accent); border-color: var(--accent); }
+    .model-row.active .id { color: var(--accent-strong); }
+
+    /* A hidden model stays listed here — dimmed and struck through — because
+       this pane is the only place it can be brought back from. */
+    .model-row.hidden .id {
+      opacity: 0.45;
+      text-decoration: line-through;
+    }
+
+    .test-ok { color: var(--accent-strong); }
+    .test-bad { color: var(--danger); }
+
+    /* Indexing is off by default, and every setting under it is meaningless
+       until it is on. Dimming the group says that at a glance; the disabled
+       attribute on each control is what actually enforces it. */
+    #semanticOptions.locked {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+
+    /* The browser default renders as a large filled block that fights every
+       other control in the panel. appearance:none replaces it with a box sized
+       to the 0.7rem text beside it, drawn from the same tokens as the inputs.
+
+       Keyed on the input, not on a row class: the panel has three of those
+       (.check-row, .chk-row, .toggle) and a per-class rule would leave whichever
+       one was added last looking like a different application. */
+    input[type="checkbox"] {
+      appearance: none;
+      -webkit-appearance: none;
+      flex-shrink: 0;
+      position: relative;
+      width: 14px;
+      height: 14px;
+      margin: 1px 0 0;
+      border: 1px solid var(--border-bright);
+      border-radius: 3px;
+      background: var(--input-bg);
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+    }
+
+    .check-row:hover input[type="checkbox"]:not(:checked),
+    .chk-row:hover input[type="checkbox"]:not(:checked) {
+      border-color: var(--accent);
+      background: var(--hover-bg);
+    }
+
+    input[type="checkbox"]:checked {
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+    }
+
+    /* Two borders on a rotated box: a tick with no font, no SVG and no asset. */
+    input[type="checkbox"]:checked::after {
+      content: '';
+      position: absolute;
+      left: 4px;
+      top: 1px;
+      width: 3px;
+      height: 7px;
+      border: solid #10241f;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+
+    /* Keyboard focus only — :focus alone would ring the box on every click. */
+    input[type="checkbox"]:focus-visible {
+      outline: 1px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    input[type="checkbox"]:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
 
     .section-label {
       font-size: 0.66rem;
@@ -2671,6 +3345,7 @@ ${built.text}`;
         <button class="modal-tab active" data-pane="providers">Keys</button>
         <button class="modal-tab" data-pane="models">Models</button>
         <button class="modal-tab" data-pane="tools">Tools</button>
+        <button class="modal-tab" data-pane="brains">Brains</button>
         <button class="modal-tab" data-pane="skills">Skills</button>
         <button class="modal-tab" data-pane="index">Index</button>
       </div>
@@ -2699,6 +3374,33 @@ ${built.text}`;
           <div class="field">
             <label for="boostModelInput">Boost model (heavy escalation)</label>
             <input type="text" id="boostModelInput" list="modelOptions" spellcheck="false">
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Available models</div>
+          <div id="modelCatalogList" class="model-catalog"></div>
+
+          <div class="section-label" style="margin-top:14px">Test a model</div>
+          <div style="display:flex; gap:6px; align-items:center">
+            <input type="text" id="testModelInput" list="modelOptions" spellcheck="false"
+                   style="flex:1; min-width:0" placeholder="model id">
+            <select id="testProviderSelect" style="flex:0 0 auto; max-width:120px"></select>
+            <button class="btn-sm" id="testModelBtn">Test</button>
+          </div>
+          <div class="field-hint" id="testModelResult" style="margin-top:6px">
+            Sends one throwaway message to check the provider really serves that
+            model with your key.
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Add a model</div>
+          <div style="display:flex; gap:6px">
+            <input type="text" id="customModelInput" spellcheck="false" style="flex:1; min-width:0"
+                   placeholder="publisher/model-id">
+            <button class="btn-sm" id="addCustomModelBtn">Add</button>
+          </div>
+          <div class="field-hint" style="margin-top:6px">
+            For a model your provider serves that isn't listed above. Added models
+            always appear in the picker, so check the id — a typo fails at send
+            time, not here.
           </div>
           <div class="field">
             <label for="temperatureInput">Temperature</label>
@@ -2752,6 +3454,110 @@ ${built.text}`;
           </div>
         </div>
 
+        <!-- Brains -->
+        <div class="modal-pane" id="pane-brains">
+          <div class="field">
+            <label class="chk-row">
+              <input type="checkbox" id="teamEnabledInput">
+              <span>Enable team mode</span>
+            </label>
+            <div class="field-hint">
+              Adds a <b>Team</b> toggle next to the model picker. A team of
+              specialist brains plans, builds and reviews, each with its own
+              model, tools and slice of the project — nothing reaches disk until
+              you approve the reviewed change set. Off by default because one
+              team run costs several ordinary turns.
+            </div>
+          </div>
+
+          <div class="section-label">The team</div>
+          <div id="brainList"></div>
+          <div class="field-hint" style="margin-top:8px">
+            Leave a model blank to use your active model. A disabled brain is
+            never assigned work, and the planner is never offered it.
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Execution</div>
+          <div class="field">
+            <label for="maxConcurrentInput">Maximum concurrent brains</label>
+            <input type="number" id="maxConcurrentInput" min="1" max="16" step="1">
+            <div class="field-hint">
+              The real ceiling is your provider's rate limit, not your CPU. Raise
+              this only if you have keys across several providers.
+            </div>
+          </div>
+          <div class="field">
+            <label for="brainTimeoutInput">Timeout per brain (seconds)</label>
+            <input type="number" id="brainTimeoutInput" min="30" max="1800" step="30">
+          </div>
+          <div class="field">
+            <label for="retriesInput">Retries per task</label>
+            <input type="number" id="retriesInput" min="0" max="3" step="1">
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Debate &amp; consensus</div>
+          <div class="field">
+            <label class="chk-row">
+              <input type="checkbox" id="debateModeInput">
+              <span>Debate mode — solve each task several ways, then pick</span>
+            </label>
+            <div class="field-hint">
+              Multiplies cost by the debate size. Worth it for design decisions,
+              wasteful for mechanical work.
+            </div>
+          </div>
+          <div class="field">
+            <label for="debateSizeInput">Brains per debate</label>
+            <input type="number" id="debateSizeInput" min="2" max="5" step="1">
+          </div>
+          <div class="field">
+            <label for="consensusModeSelect">How the winner is chosen</label>
+            <select id="consensusModeSelect">
+              <option value="weighted">Weighted — quality, security, architecture, confidence, cost</option>
+              <option value="reviewer">Reviewer only — the review scores decide</option>
+              <option value="first">First — take the first answer, no comparison</option>
+            </select>
+            <div class="field-hint">
+              Never a majority vote: brains agreeing because they share a wrong
+              assumption is not evidence.
+            </div>
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Approval &amp; budget</div>
+          <div class="field">
+            <label for="approvalPolicySelect">When to stop for approval</label>
+            <select id="approvalPolicySelect">
+              <option value="always">Always — review every run</option>
+              <option value="on-conflict">Only on conflicts or a rejected review</option>
+              <option value="never">Never — apply automatically</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="runBudgetInput">Budget per run (USD, 0 = off)</label>
+            <input type="number" id="runBudgetInput" min="0" step="0.05">
+          </div>
+          <div class="field">
+            <label for="monthlyBudgetInput">Budget per month (USD, 0 = off)</label>
+            <input type="number" id="monthlyBudgetInput" min="0" step="1">
+            <div class="field-hint">
+              Past the budget, brains are routed to the cheapest tool-capable
+              model rather than stopped mid-run.
+            </div>
+          </div>
+
+          <div class="section-label" style="margin-top:14px">Installed brain packs</div>
+          <div id="brainRootList"></div>
+          <div style="display:flex; gap:8px; margin-top:6px">
+            <button class="btn-link" id="addBrainRootBtn">+ Add folder</button>
+            <button class="btn-link" id="reloadBrainsBtn">Reload packs</button>
+          </div>
+          <div class="field-hint" style="margin-top:8px">
+            A pack is a folder holding brain.json and prompt.md. Packs are data,
+            never code — installing one can add a brain, never run anything.
+          </div>
+          <div id="brainProblems"></div>
+        </div>
+
         <!-- Skills -->
         <div class="modal-pane" id="pane-skills">
           <div class="section-label">Skills</div>
@@ -2788,15 +3594,17 @@ ${built.text}`;
             you pick below.
           </div>
 
-          <label class="tool-row">
+          <label class="check-row">
             <input type="checkbox" id="semanticEnabled">
             <span><b>Enable semantic indexing</b></span>
           </label>
-          <label class="tool-row">
+
+          <div id="semanticOptions">
+          <label class="check-row">
             <input type="checkbox" id="semanticAutoContext">
             <span>Retrieve context automatically for every message</span>
           </label>
-          <label class="tool-row">
+          <label class="check-row">
             <input type="checkbox" id="semanticAutoUpdate">
             <span>Keep the index current as files change</span>
           </label>
@@ -2864,6 +3672,7 @@ ${built.text}`;
             <button class="btn-link" id="updateIndexBtn">Update</button>
             <button class="btn-link" id="clearIndexBtn">Clear</button>
           </div>
+          </div>
         </div>
 
       </div>
@@ -2885,24 +3694,52 @@ ${built.text}`;
   <div class="main-content" id="mainContent">
     <!-- Centered Empty Session Landing View -->
     <div class="landing-view" id="landingView">
-      <div class="landing-brand">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2L15 9L22 12L15 15L12 22L9 15L2 12L9 9Z"></path>
+      <!-- The extension's own mark, inlined rather than loaded from assets/ so it
+           inherits currentColor and themes with the panel. Same paths as
+           assets/icon.svg — keep the two in step if either changes. -->
+      <div class="landing-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M5.2 3.5h-.7a1.5 1.5 0 0 0-1.5 1.5v4a2 2 0 0 1-1.5 2 2 2 0 0 1 1.5 2v4a1.5 1.5 0 0 0 1.5 1.5h.7"/>
+          <path d="M18.8 3.5h.7a1.5 1.5 0 0 1 1.5 1.5v4a2 2 0 0 0 1.5 2 2 2 0 0 0-1.5 2v4a1.5 1.5 0 0 1-1.5 1.5h-.7"/>
+          <g transform="translate(12 12) scale(.62) translate(-12 -12)">
+            <path d="M12 12c-2-2.67-4-4-6-4a4 4 0 1 0 0 8c2 0 4-1.33 6-4Zm0 0c2 2.67 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.33-6 4Z"/>
+          </g>
         </svg>
-        Infinity Coder
       </div>
 
-      <!-- Pixel Vector Art Icon -->
-      <svg class="landing-art" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <rect x="5" y="7" width="14" height="10" rx="2"></rect>
-        <circle cx="9" cy="11" r="1" fill="currentColor"></circle>
-        <circle cx="15" cy="11" r="1" fill="currentColor"></circle>
-        <path d="M9 14h6" stroke-linecap="round"></path>
-      </svg>
-
+      <div class="landing-brand">Infinity Coder</div>
       <div class="landing-info">
-        Your voice & text AI assistant for VS Code.<br>
-        Type a prompt or press <strong>/</strong> for commands.
+        Your AI pair programmer, working directly on this project — it reads,
+        writes and runs, it doesn't hand you snippets to paste.
+      </div>
+
+      <!-- Starters. These FILL the box rather than sending: the first thing a
+           new user needs is to see the shape of a good request, and a click that
+           silently spends a turn is a worse introduction than one that doesn't. -->
+      <div class="landing-chips" id="landingChips">
+        <button class="landing-chip" data-prompt="Explain what this project does, how it is structured, and where the entry points are.">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <span>Explain this codebase</span>
+        </button>
+        <button class="landing-chip" data-prompt="Find and fix the bug in ">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 2 1.88 1.88M14.12 3.88 16 2M9 7.13V6a3 3 0 1 1 6 0v1.13"/><path d="M12 20a6 6 0 0 0 6-6v-3a6 6 0 0 0-12 0v3a6 6 0 0 0 6 6ZM3 13h4M17 13h4"/></svg>
+          <span>Find and fix a bug</span>
+        </button>
+        <button class="landing-chip" data-prompt="Write tests for ">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v7.31l-5.66 9.8A2 2 0 0 0 6.07 22h11.86a2 2 0 0 0 1.73-2.89L14 9.31V2"/><path d="M8.5 2h7M7 16h10"/></svg>
+          <span>Write tests for a file</span>
+        </button>
+        <button class="landing-chip" data-prompt="Review the uncommitted changes on this branch and tell me what is wrong with them.">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <span>Review my changes</span>
+        </button>
+      </div>
+
+      <div class="landing-hints">
+        <span><kbd>/</kbd>commands</span>
+        <span><kbd>@</kbd>files</span>
+        <span><kbd>ctrl</kbd><kbd>esc</kbd>focus</span>
       </div>
     </div>
 
@@ -2930,7 +3767,6 @@ ${built.text}`;
       <span class="stream-status-label" id="streamStatusLabel">Thinking</span>
       <span class="stream-status-dots"><i></i><i></i><i></i></span>
       <span class="stream-status-time" id="streamStatusTime"></span>
-      <button class="stream-status-stop" id="streamStatusStop" title="Stop generating">Stop</button>
     </div>
 
     <div class="input-card">
@@ -2945,6 +3781,9 @@ ${built.text}`;
         <div class="input-card-right">
           <button class="plan-toggle" id="planToggle" title="Plan mode — investigate and propose a plan, change nothing">
             <span class="plan-toggle-dot"></span>Plan
+          </button>
+          <button class="plan-toggle" id="teamToggle" title="Team mode — a team of specialist brains plans, builds, reviews and hands you one change set">
+            <span class="plan-toggle-dot"></span>Team
           </button>
           <select class="model-select-inline" id="modelSelect" title="Select Model">
             <option value="">Connecting...</option>
@@ -2969,6 +3808,7 @@ ${built.text}`;
     const messagesContainer = document.getElementById('messagesContainer');
     const promptInput = document.getElementById('promptInput');
     const planToggle = document.getElementById('planToggle');
+    const teamToggle = document.getElementById('teamToggle');
     const sendBtn = document.getElementById('sendBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const settingsBtn = document.getElementById('settingsBtn');
@@ -3153,6 +3993,9 @@ ${built.text}`;
         }
         renderHistoryMenu(msg.sessions || [], msg.activeSessionId);
         renderMessages(msg.messages || []);
+      } else if (msg.type === 'modelTestResult') {
+        testModelResult.className = 'field-hint ' + (msg.ok ? 'test-ok' : 'test-bad');
+        testModelResult.textContent = (msg.ok ? '✓ ' : '✕ ') + msg.modelId + ' — ' + msg.message;
       } else if (msg.type === 'indexStats') {
         const box = document.getElementById('semanticStats');
         if (box) {
@@ -3635,7 +4478,8 @@ ${built.text}`;
         model: modelSelect.value,
         attachments: attachedFiles.map(f => f.path),
         skills: pinnedSkills.slice(),
-        planMode
+        planMode,
+        teamMode
       });
       promptInput.value = '';
       attachedFiles = [];
@@ -3645,6 +4489,34 @@ ${built.text}`;
       hideFileMenu();
     }
 
+    /**
+     * Which Thinking panels the user has opened, keyed by message id + block.
+     *
+     * renderMessages rebuilds the entire thread on every streamed chunk, so a
+     * <details> element only lives until the next token — without this, a panel
+     * you expanded snaps shut the moment the model emits anything.
+     */
+    const openThinking = new Set();
+
+    function renderThinking(key, text) {
+      const details = document.createElement('details');
+      details.className = 'thinking';
+      details.open = openThinking.has(key);
+      details.innerHTML = \`<summary>Thinking Process</summary><div class="thinking-body">\${escapeHtml(text)}</div>\`;
+      details.addEventListener('toggle', () => {
+        if (details.open) {
+          openThinking.add(key);
+        } else {
+          openThinking.delete(key);
+        }
+      });
+      return details;
+    }
+
+    /** Treat this much slack from the bottom as "still following the stream". */
+    const STICK_TO_BOTTOM_PX = 60;
+    let lastRenderedCount = 0;
+
     function renderMessages(messages) {
       if (!messages || messages.length === 0) {
         landingView.style.display = 'flex';
@@ -3652,8 +4524,20 @@ ${built.text}`;
         messagesContainer.innerHTML = '';
         updateSendBtnState(false);
         updateStreamStatus([]);
+        lastRenderedCount = 0;
         return;
       }
+
+      // Measured BEFORE the rebuild, which resets scrollTop. Scrolling back down
+      // unconditionally is the other half of the same bug: expand the thinking,
+      // scroll up to read it, and the next chunk drags you away from it.
+      const distanceFromBottom =
+        mainContent.scrollHeight - mainContent.scrollTop - mainContent.clientHeight;
+      // A brand-new message always wins — someone who just hit send expects to
+      // be taken to the reply, wherever they were reading.
+      const stickToBottom =
+        distanceFromBottom < STICK_TO_BOTTOM_PX || messages.length !== lastRenderedCount;
+      lastRenderedCount = messages.length;
 
       landingView.style.display = 'none';
       messagesContainer.style.display = 'flex';
@@ -3683,12 +4567,11 @@ ${built.text}`;
 
         // Render Chronological Message Blocks if available
         if (m.blocks && m.blocks.length > 0) {
-          m.blocks.forEach(block => {
+          m.blocks.forEach((block, blockIndex) => {
             if (block.type === 'reasoning' && block.text) {
-              const details = document.createElement('details');
-              details.className = 'thinking';
-              details.innerHTML = \`<summary>Thinking Process</summary><div class="thinking-body">\${escapeHtml(block.text)}</div>\`;
-              div.appendChild(details);
+              // Keyed by position, which is stable: blocks are only ever
+              // appended, so an existing reasoning block never changes index.
+              div.appendChild(renderThinking(m.id + ':' + blockIndex, block.text));
             } else if (block.type === 'tool') {
               const toolItem = document.createElement('div');
               toolItem.className = 'tool-indicator ' + (block.done ? 'done' : 'running');
@@ -3764,10 +4647,7 @@ ${built.text}`;
         } else {
           // Fallback for legacy messages without blocks array
           if (m.reasoning) {
-            const details = document.createElement('details');
-            details.className = 'thinking';
-            details.innerHTML = \`<summary>Thinking Process</summary><div class="thinking-body">\${escapeHtml(m.reasoning)}</div>\`;
-            div.appendChild(details);
+            div.appendChild(renderThinking(m.id + ':reasoning', m.reasoning));
           }
 
           if (m.toolEvents && m.toolEvents.length > 0) {
@@ -3890,7 +4770,9 @@ ${built.text}`;
 
       updateSendBtnState(hasActiveStream);
       updateStreamStatus(messages);
-      mainContent.scrollTop = mainContent.scrollHeight;
+      if (stickToBottom) {
+        mainContent.scrollTop = mainContent.scrollHeight;
+      }
     }
 
     // ── Plan mode ────────────────────────────────────────────────────
@@ -3898,18 +4780,61 @@ ${built.text}`;
     // thread changes: carrying it into a different chat silently would make the
     // next message do nothing anyone asked for.
     let planMode = false;
+    let teamMode = false;
     let shownSessionId = null;
+
+    function syncPlaceholder() {
+      promptInput.placeholder = teamMode
+        ? 'Team mode — describe the goal, a team of brains will plan and build it...'
+        : planMode
+          ? 'Plan mode — describe the task, nothing will be changed...'
+          : 'ctrl esc to focus or ask Infinity Coder...';
+    }
 
     function setPlanMode(on) {
       planMode = !!on;
       planToggle.classList.toggle('on', planMode);
       planToggle.setAttribute('aria-pressed', planMode ? 'true' : 'false');
-      promptInput.placeholder = planMode
-        ? 'Plan mode — describe the task, nothing will be changed...'
-        : 'ctrl esc to focus or ask Infinity Coder...';
+      // Plan and Team are mutually exclusive: plan mode withholds every write
+      // tool, so a team run under it would produce an empty change set.
+      if (planMode && teamMode) { setTeamMode(false); }
+      syncPlaceholder();
+    }
+
+    function setTeamMode(on) {
+      teamMode = !!on;
+      teamToggle.classList.toggle('on', teamMode);
+      teamToggle.setAttribute('aria-pressed', teamMode ? 'true' : 'false');
+      if (teamMode && planMode) { setPlanMode(false); }
+      syncPlaceholder();
     }
 
     planToggle.addEventListener('click', () => setPlanMode(!planMode));
+    teamToggle.addEventListener('click', () => setTeamMode(!teamMode));
+
+    // Landing starters fill the box and hand over the caret — an unfinished one
+    // ("Write tests for ") is meant to be completed, not sent.
+    document.querySelectorAll('.landing-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        promptInput.value = chip.dataset.prompt || '';
+        promptInput.focus();
+        promptInput.selectionStart = promptInput.selectionEnd = promptInput.value.length;
+        promptInput.dispatchEvent(new Event('input'));
+      });
+    });
+
+    /**
+     * Team mode is opt-in in Settings → Brains. Until then the toggle is not in
+     * the input at all — hidden rather than disabled, because a greyed-out
+     * button invites a click that does nothing.
+     */
+    function applyTeamAvailability(on) {
+      teamToggle.style.display = on ? '' : 'none';
+      // Turning it off while a run is armed must not leave the flag set on a
+      // control the user can no longer see.
+      if (!on && teamMode) { setTeamMode(false); }
+    }
+    applyTeamAvailability(false);
 
     // Answered locally the moment it is clicked, for the same reason approvals
     // are: the buttons must stop looking clickable without waiting for a
@@ -4098,9 +5023,6 @@ ${built.text}`;
     let streamStartedAt = null;
     let streamTicker = null;
 
-    document.getElementById('streamStatusStop').addEventListener('click', () => {
-      vscode.postMessage({ type: 'stopGeneration' });
-    });
 
     function streamActivity(m) {
       const blocks = m.blocks || [];
@@ -4382,37 +5304,122 @@ ${built.text}`;
     }
 
     function renderModelOptions() {
-      // Static catalog plus anything a successful key Test discovered live, so
-      // providers whose ids we don't hardcode still populate the dropdown.
-      const seen = {};
-      const entries = [];
-      settingsState.catalog.forEach(m => {
-        if (seen[m.id]) { return; }
-        seen[m.id] = true;
-        entries.push({ id: m.id, label: m.name + ' — ' + m.publisher });
-      });
-      let discoveredCount = 0;
-      Object.keys(settingsState.discovered || {}).forEach(pid => {
-        settingsState.discovered[pid].forEach(id => {
-          if (seen[id]) { return; }
-          seen[id] = true;
-          discoveredCount++;
-          entries.push({ id: id, label: pid });
-        });
-      });
+      const entries = settingsState.catalog || [];
 
+      // The datalist drives type-ahead on both model inputs. Hidden models are
+      // left out here but still rendered in the list below, which is where they
+      // can be brought back.
       modelOptions.innerHTML = '';
-      entries.forEach(e => {
+      entries.filter(e => !e.hidden).forEach(e => {
         const opt = document.createElement('option');
         opt.value = e.id;
-        opt.label = e.label;
+        opt.label = e.name + ' — ' + e.provider;
         modelOptions.appendChild(opt);
       });
 
-      modelDiscoverHint.textContent = discoveredCount
-        ? 'Type or pick. ' + discoveredCount + ' extra models discovered from your providers.'
-        : 'Type or pick. Test a key in Providers to discover that endpoint’s models.';
+      // The visible list. Typing an id is fine, but nobody can type an id they
+      // have not seen, so what is reachable has to be shown.
+      const list = document.getElementById('modelCatalogList');
+      list.innerHTML = '';
+      entries.forEach(e => {
+        const row = document.createElement('div');
+        row.className = 'model-row' + (e.id === activeModelInput.value ? ' active' : '') +
+          (e.hidden ? ' hidden' : '');
+
+        const id = document.createElement('span');
+        id.className = 'id';
+        id.textContent = e.id;
+        id.title = e.name + ' — ' + e.provider + (e.tools ? '' : ' (no tool calling)');
+        row.appendChild(id);
+
+        const who = document.createElement('span');
+        who.className = 'who';
+        who.textContent = e.providerId === 'custom' ? 'added' : e.provider;
+        row.appendChild(who);
+
+        const use = document.createElement('button');
+        use.className = 'use';
+        use.textContent = 'Use';
+        use.title = 'Set as the active model';
+        use.addEventListener('click', () => {
+          activeModelInput.value = e.id;
+          renderModelOptions();
+        });
+        row.appendChild(use);
+
+        row.appendChild(iconBtn(e.hidden ? '◯' : '◉', e.hidden
+          ? 'Show this model in the picker'
+          : 'Hide this model from the picker', () => {
+          settingsAction('toggleHideModel', { modelId: e.id });
+        }));
+
+        if (e.providerId === 'custom') {
+          row.appendChild(iconBtn('✕', 'Remove this model', () => {
+            settingsAction('removeCustomModel', { modelId: e.id });
+          }, 'danger'));
+        }
+        list.appendChild(row);
+      });
+
+      const custom = entries.filter(e => e.providerId === 'custom').length;
+      const hiddenCount = entries.filter(e => e.hidden).length;
+      modelDiscoverHint.textContent = entries.length
+        ? (entries.length - hiddenCount) + ' models in the picker' +
+          (custom ? ', ' + custom + ' added by you' : '') +
+          (hiddenCount ? ', ' + hiddenCount + ' hidden' : '') + '.'
+        : 'No models yet — add a provider key under Keys.';
+
+      renderTestProviders();
     }
+
+    // ── model test ───────────────────────────────────────────────────
+    const testModelInput = document.getElementById('testModelInput');
+    const testProviderSelect = document.getElementById('testProviderSelect');
+    const testModelResult = document.getElementById('testModelResult');
+
+    function renderTestProviders() {
+      // Only providers with a key: testing against one without is a guaranteed
+      // failure that says nothing about the model.
+      const keyed = (settingsState.settings.providers || []).filter(p => p.enabled && p.keys.length > 0);
+      const previous = testProviderSelect.value;
+      testProviderSelect.innerHTML = '';
+      keyed.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        testProviderSelect.appendChild(opt);
+      });
+      if (keyed.some(p => p.id === previous)) {
+        testProviderSelect.value = previous;
+      }
+      testProviderSelect.disabled = keyed.length === 0;
+    }
+
+    document.getElementById('testModelBtn').addEventListener('click', () => {
+      const modelId = testModelInput.value.trim() || activeModelInput.value.trim();
+      if (!modelId) {
+        testModelResult.className = 'field-hint test-bad';
+        testModelResult.textContent = 'Enter a model id first.';
+        return;
+      }
+      testModelResult.className = 'field-hint';
+      testModelResult.textContent = 'Testing ' + modelId + '…';
+      vscode.postMessage({ type: 'testModel', modelId, providerId: testProviderSelect.value });
+    });
+
+    function addCustomModel() {
+      const input = document.getElementById('customModelInput');
+      const id = input.value.trim();
+      if (!id) { return; }
+      settingsAction('addCustomModel', { modelId: id });
+      input.value = '';
+    }
+
+    document.getElementById('addCustomModelBtn').addEventListener('click', addCustomModel);
+    document.getElementById('customModelInput').addEventListener('keydown', (e) => {
+      // Enter in a single-field form should submit it.
+      if (e.key === 'Enter') { e.preventDefault(); addCustomModel(); }
+    });
 
     function renderToolGroups() {
       toolGroupList.innerHTML = '';
@@ -4555,6 +5562,198 @@ ${built.text}`;
       maxRoundsInput.value = s.maxToolRounds;
       approvalSelect.value = s.approvalMode || 'ask';
       applySemanticSettings(s);
+      renderBrains();
+    }
+
+    // ── Brains ────────────────────────────────────────────────────────
+    const brainFields = {
+      teamEnabled: document.getElementById('teamEnabledInput'),
+      maxConcurrent: document.getElementById('maxConcurrentInput'),
+      brainTimeout: document.getElementById('brainTimeoutInput'),
+      retries: document.getElementById('retriesInput'),
+      debateMode: document.getElementById('debateModeInput'),
+      debateSize: document.getElementById('debateSizeInput'),
+      consensusMode: document.getElementById('consensusModeSelect'),
+      approvalPolicy: document.getElementById('approvalPolicySelect'),
+      runBudget: document.getElementById('runBudgetInput'),
+      monthlyBudget: document.getElementById('monthlyBudgetInput'),
+    };
+
+    // Orchestration settings save on change rather than on the modal's Save
+    // button: they live in their own store, and a brain toggle that needed a
+    // second click to stick would be the kind of thing nobody notices until it
+    // has already cost them a run.
+    function pushOrchestration() {
+      // Applied to the input immediately, not on the next settingsUpdate: the
+      // checkbox is about a control the user is looking at, and a toggle that
+      // takes a round-trip to appear reads as broken.
+      applyTeamAvailability(brainFields.teamEnabled.checked);
+      settingsAction('saveOrchestration', {
+        patch: {
+          enabled: brainFields.teamEnabled.checked,
+          maxConcurrentBrains: parseInt(brainFields.maxConcurrent.value, 10) || 4,
+          brainTimeoutMs: (parseInt(brainFields.brainTimeout.value, 10) || 300) * 1000,
+          retriesPerTask: parseInt(brainFields.retries.value, 10) || 0,
+          debateMode: brainFields.debateMode.checked,
+          debateSize: parseInt(brainFields.debateSize.value, 10) || 3,
+          consensusMode: brainFields.consensusMode.value,
+          approvalPolicy: brainFields.approvalPolicy.value,
+          runBudgetUsd: parseFloat(brainFields.runBudget.value) || 0,
+          monthlyBudgetUsd: parseFloat(brainFields.monthlyBudget.value) || 0,
+        }
+      });
+    }
+
+    Object.keys(brainFields).forEach(key => {
+      brainFields[key].addEventListener('change', pushOrchestration);
+    });
+
+    document.getElementById('addBrainRootBtn').addEventListener('click', () => {
+      settingsAction('addBrainRoot');
+    });
+    document.getElementById('reloadBrainsBtn').addEventListener('click', () => {
+      settingsAction('reloadBrains');
+    });
+
+    function renderBrains() {
+      const o = (settingsState && settingsState.orchestration) || null;
+      const brains = (settingsState && settingsState.brains) || [];
+      const list = document.getElementById('brainList');
+      if (!list) { return; }
+
+      if (o) {
+        brainFields.teamEnabled.checked = !!o.enabled;
+        applyTeamAvailability(!!o.enabled);
+        brainFields.maxConcurrent.value = o.maxConcurrentBrains;
+        brainFields.brainTimeout.value = Math.round(o.brainTimeoutMs / 1000);
+        brainFields.retries.value = o.retriesPerTask;
+        brainFields.debateMode.checked = !!o.debateMode;
+        brainFields.debateSize.value = o.debateSize;
+        brainFields.consensusMode.value = o.consensusMode;
+        brainFields.approvalPolicy.value = o.approvalPolicy;
+        brainFields.runBudget.value = o.runBudgetUsd;
+        brainFields.monthlyBudget.value = o.monthlyBudgetUsd;
+      }
+
+      list.innerHTML = '';
+      brains.forEach(b => {
+        const card = document.createElement('div');
+        card.className = 'prov-card' + (b.enabled ? '' : ' disabled');
+
+        const head = document.createElement('div');
+        head.className = 'prov-head';
+
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.className = 'toggle';
+        toggle.checked = b.enabled;
+        toggle.title = 'Assign work to this brain';
+        toggle.addEventListener('change', () => {
+          settingsAction('setBrainOverride', { id: b.id, override: { enabled: toggle.checked } });
+        });
+        head.appendChild(toggle);
+
+        const name = document.createElement('span');
+        name.style.flex = '1';
+        name.style.minWidth = '0';
+        name.textContent = b.name;
+        head.appendChild(name);
+
+        if (b.source !== 'builtin') {
+          const tag = document.createElement('span');
+          tag.className = 'field-hint';
+          tag.textContent = b.source;
+          head.appendChild(tag);
+        }
+        head.appendChild(iconBtn('↺', 'Reset this brain to its defaults', () => {
+          settingsAction('resetBrain', { id: b.id });
+        }));
+        card.appendChild(head);
+
+        const desc = document.createElement('div');
+        desc.className = 'field-hint';
+        desc.textContent = b.description;
+        card.appendChild(desc);
+
+        const scope = document.createElement('div');
+        scope.className = 'field-hint';
+        // The write scope is the thing people get surprised by, so it is shown
+        // rather than buried: it is why the frontend brain cannot touch server/.
+        scope.textContent = b.contextMode === 'globs'
+          ? 'Owns: ' + (b.scope.slice(0, 3).join(', ') || 'nothing') +
+            (b.scope.length > 3 ? ' +' + (b.scope.length - 3) + ' more' : '')
+          : b.contextMode === 'changed'
+            ? 'Reads only what this run changed · read-only'
+            : b.contextMode === 'summary'
+              ? 'Reads a project summary only · read-only'
+              : 'No workspace context';
+        card.appendChild(scope);
+
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        row.style.marginTop = '6px';
+
+        const model = document.createElement('input');
+        model.type = 'text';
+        model.placeholder = 'model (blank = active model)';
+        model.value = b.model || '';
+        model.style.flex = '2';
+        model.style.minWidth = '0';
+        model.addEventListener('change', () => {
+          settingsAction('setBrainOverride', { id: b.id, override: { model: model.value.trim() } });
+        });
+        row.appendChild(model);
+
+        const provider = document.createElement('select');
+        provider.style.flex = '1';
+        provider.style.minWidth = '0';
+        const anyOpt = document.createElement('option');
+        anyOpt.value = '';
+        anyOpt.textContent = 'any provider';
+        provider.appendChild(anyOpt);
+        (settingsState.settings.providers || []).forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.id;
+          opt.textContent = p.name;
+          provider.appendChild(opt);
+        });
+        provider.value = b.provider || '';
+        provider.addEventListener('change', () => {
+          settingsAction('setBrainOverride', { id: b.id, override: { provider: provider.value } });
+        });
+        row.appendChild(provider);
+
+        card.appendChild(row);
+        list.appendChild(card);
+      });
+
+      const rootList = document.getElementById('brainRootList');
+      rootList.innerHTML = '';
+      ((o && o.brainRoots) || []).forEach(root => {
+        const row = document.createElement('div');
+        row.className = 'skill-root';
+        const text = document.createElement('span');
+        text.style.flex = '1';
+        text.style.minWidth = '0';
+        text.textContent = root;
+        row.appendChild(text);
+        row.appendChild(iconBtn('✕', 'Stop scanning this folder', () => {
+          settingsAction('removeBrainRoot', { root: root });
+        }, 'danger'));
+        rootList.appendChild(row);
+      });
+
+      const problems = document.getElementById('brainProblems');
+      const found = (settingsState && settingsState.brainProblems) || [];
+      problems.innerHTML = '';
+      found.forEach(p => {
+        const row = document.createElement('div');
+        row.className = 'field-hint';
+        row.style.color = 'var(--danger, #f14c4c)';
+        row.textContent = p.source + ' — ' + p.message;
+        problems.appendChild(row);
+      });
     }
 
     const semanticFields = {
@@ -4583,6 +5782,7 @@ ${built.text}`;
       semanticFields.maxFiles.value = sem.maxFiles || 100000;
       semanticFields.maxChunks.value = sem.maxChunks || 400000;
       semanticFields.excluded.value = (sem.excluded || []).join(', ');
+      syncSemanticLock();
 
       // Rebuilt from the live provider list, so a provider added under Keys
       // shows up here without reopening the modal.
@@ -4623,6 +5823,17 @@ ${built.text}`;
       settingsAction('save', { patch: { semantic: readSemanticSettings() } });
       vscode.postMessage({ type: 'indexCommand', command });
     }
+
+    // pointer-events alone would still leave the controls tabbable and
+    // submittable, so the disabled attribute is set on each one as well.
+    function syncSemanticLock() {
+      const on = semanticFields.enabled.checked;
+      const group = document.getElementById('semanticOptions');
+      group.classList.toggle('locked', !on);
+      group.querySelectorAll('input, select, button').forEach(el => { el.disabled = !on; });
+    }
+
+    semanticFields.enabled.addEventListener('change', syncSemanticLock);
 
     document.getElementById('buildIndexBtn').addEventListener('click', () => runIndexCommand('build'));
     document.getElementById('updateIndexBtn').addEventListener('click', () => runIndexCommand('update'));

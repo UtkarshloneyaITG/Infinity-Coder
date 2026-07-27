@@ -118,12 +118,24 @@ async function main() {
   for (const id of [
     'settingsModal', 'providerList', 'toolGroupList', 'approvalSelect', 'maxContextInput',
     'filePopover', 'fileList', 'attachChips', 'promptInput', 'sendBtn', 'modelSelect',
-    'streamStatus', 'streamStatusLabel', 'streamStatusTime', 'streamStatusStop',
+    'streamStatus', 'streamStatusLabel', 'streamStatusTime',
     'maxRoundsInput', 'skillList', 'skillRootList', 'skillBudget',
     'addSkillRootBtn', 'rescanSkillsBtn', 'skillChips',
   ]) {
     assert.ok(html.includes(`id="${id}"`), `missing element #${id}`);
   }
+
+  // ── the empty-session landing view ───────────────────────────────
+  // It is the first thing anyone sees, and it is pure markup, so nothing else
+  // would catch it going missing.
+  assert.ok(html.includes('class="landing-mark"'), 'the landing view shows the extension mark');
+  assert.ok(html.includes('id="landingChips"'), 'the landing view offers starter prompts');
+  assert.ok(!/<rect x="5" y="7" width="14" height="10"/.test(html), 'the placeholder robot art is gone');
+  // A starter that sent on click would spend a turn before the user had typed
+  // anything, so the handler must only fill the box.
+  const chipWiring = inline!.slice(inline!.indexOf(".landing-chip'"));
+  assert.ok(/promptInput\.value\s*=/.test(chipWiring), 'a starter fills the input');
+  assert.ok(!/sendMessage\(\)/.test(chipWiring.slice(0, 400)), 'a starter must not send by itself');
 
   // ── path anchoring for tool-card file links ──────────────────────
   // The trap: path.isAbsolute('/src/app.tsx') is TRUE on win32, so using it here
@@ -188,6 +200,7 @@ async function main() {
     let pinnedSkills = [];
     let attachedFiles = [];
     let planMode = deps.planMode || false;
+    let teamMode = deps.teamMode || false;
     ${sendSource}
     return { sendMessage, executeSlashCmd };
   `);
@@ -209,6 +222,18 @@ async function main() {
     return sent;
   };
 
+  // Every semantic setting is meaningless until indexing is enabled, so the
+  // group is gated. Without the disabled attribute the controls stay tabbable
+  // and would still submit values for a feature that is switched off.
+  assert.ok(html.includes('id="semanticOptions"'), 'the semantic settings are grouped');
+  assert.ok(inline!.includes('syncSemanticLock'), 'and the group is locked when disabled');
+  assert.ok(inline!.includes('el.disabled = !on'), 'the lock disables the controls, not just the pointer');
+
+  // Stopping a run lives only on the send button now, which swaps to a stop
+  // control while streaming. If that ever regresses there is no way to cancel.
+  assert.ok(inline!.includes('stop-mode'), 'the send button still has a stop state');
+  assert.ok(inline!.includes("type: 'stopGeneration'"), 'and still posts stopGeneration');
+
   // Plan mode has to reach the extension, or the toggle is decorative and the
   // agent quietly edits files while the user thinks it is only planning.
   const planned = ((): any[] => {
@@ -228,6 +253,57 @@ async function main() {
   for (const needle of ['renderPlanActions', 'planResponse', 'setPlanMode']) {
     assert.ok(inline!.includes(needle), `plan mode is missing: ${needle}`);
   }
+
+  // ── the thread survives a re-render ──────────────────────────────
+  // renderMessages rebuilds the whole thread on every streamed chunk. Two things
+  // must outlive that, and both were lost before: a Thinking panel the user
+  // expanded, and their scroll position when they had scrolled up to read it.
+  const thinking = grab('function renderThinking(key, text) {');
+  assert.ok(/details\.open\s*=\s*openThinking\.has\(key\)/.test(thinking),
+    'an expanded Thinking panel must reopen after a re-render');
+  assert.ok(/addEventListener\('toggle'/.test(thinking),
+    'expanding a Thinking panel must be remembered');
+  // Set before the listener is attached, or the programmatic open re-fires into
+  // its own handler.
+  assert.ok(
+    thinking.indexOf('details.open =') < thinking.indexOf("addEventListener('toggle'"),
+    'open state is applied before the toggle listener is attached'
+  );
+  assert.ok(!/\bconst details = document\.createElement\('details'\);[\s\S]{0,400}?className = 'thinking'[\s\S]{0,400}?appendChild\(details\)/.test(
+    inline!.replace(thinking, '')
+  ), 'every Thinking panel goes through renderThinking, so none can lose its state');
+  assert.ok(/if \(stickToBottom\) \{\s*mainContent\.scrollTop/.test(inline!),
+    'the thread must only auto-scroll when the user was already at the bottom');
+
+  // Team mode, same reasoning: a toggle that never reaches the extension would
+  // silently run the single agent while the user believes a whole team ran.
+  const teamed = ((): any[] => {
+    const sentInTeam: any[] = [];
+    buildHarness({
+      promptInput: { value: 'build authentication', focus() {}, selectionStart: 0 },
+      vscode: { postMessage: (m: any) => sentInTeam.push(m) },
+      modelSelect: { value: 'm' },
+      hideSlashMenu() {}, hideFileMenu() {}, renderAttachChips() {}, renderSkillChips() {},
+      skillCommands: [],
+      teamMode: true,
+    }).sendMessage();
+    return sentInTeam;
+  })();
+  assert.strictEqual(teamed[0].teamMode, true, 'team mode is sent with the message');
+  assert.strictEqual(teamed[0].planMode, false, 'plan and team are independent flags');
+  assert.ok(html.includes('id="teamToggle"'), 'the team toggle exists in the panel');
+  assert.ok(html.includes('id="pane-brains"'), 'brains are configured in Settings, not a separate panel');
+  for (const needle of ['setTeamMode', 'renderBrains', 'setBrainOverride', 'saveOrchestration']) {
+    assert.ok(inline!.includes(needle), `team mode is missing: ${needle}`);
+  }
+
+  // Team mode is opt-in, so the toggle must start hidden and only appear once
+  // the setting turns it on — otherwise "disabled" means nothing.
+  assert.ok(html.includes('id="teamEnabledInput"'), 'Settings must carry the team-mode switch');
+  assert.ok(inline!.includes('applyTeamAvailability(false)'), 'the team toggle must start hidden');
+  const availability = grab('function applyTeamAvailability(on) {');
+  assert.ok(/display\s*=\s*on\s*\?/.test(availability), 'the switch drives the toggle visibility');
+  assert.ok(/setTeamMode\(false\)/.test(availability), 'disabling team mode must clear the armed flag');
 
   // Clicking a skill with an empty box sends straight away.
   let sent = fire('', api => api.executeSlashCmd('/ponytail-review'));

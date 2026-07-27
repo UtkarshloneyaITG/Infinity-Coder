@@ -13,7 +13,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { chunkFile, extractImports, extractExports, estimateTokens, sha1 } from './chunker';
-import { normalize, dot } from './embeddings';
+import { normalize, dot, OpenAICompatibleEmbeddings } from './embeddings';
 import { FlatFileVectorStore, MemoryVectorStore, quantize, dotQuantized, IndexFullError } from './store';
 import { rank, keywordScore, tokenizeQuery, buildContext, SemanticSearchEngine } from './search';
 import { Chunk, EmbeddingProvider } from './types';
@@ -198,6 +198,54 @@ async function main() {
   assert.ok(Math.abs(dotQuantized(a, packed, 0) - 1) < 0.02, 'a vector against itself is ~1');
   assert.ok(dotQuantized(a, packed, 10) > dotQuantized(a, packed, 20), 'int8 preserves ranking');
   assert.ok(Math.abs(dotQuantized(a, packed, 10) - dot(a, b)) < 0.02, 'int8 error stays under 2%');
+
+  // ── asymmetric models: input_type is learned from the rejection ──
+  // NVIDIA's nv-embedqa family 400s without input_type. Rather than hardcode a
+  // list of asymmetric model names, the provider reads the refusal and retries.
+  {
+    const seen: any[] = [];
+    const fakeFetch = (async (_url: string, init: any) => {
+      const body = JSON.parse(init.body);
+      seen.push(body);
+      if (body.input_type === undefined) {
+        return {
+          ok: false, status: 400,
+          text: async () => '{"error":"\'input_type\' parameter is required for asymmetric models"}',
+        };
+      }
+      return {
+        ok: true, status: 200,
+        json: async () => ({ data: body.input.map((_: string, i: number) => ({ index: i, embedding: [1, 0, 0] })) }),
+      };
+    }) as any;
+
+    const nim = new OpenAICompatibleEmbeddings({
+      id: 'nvidia', baseUrl: 'https://integrate.api.nvidia.com/v1',
+      apiKey: 'k', model: 'nvidia/nv-embedqa-e5-v5', fetchImpl: fakeFetch,
+    });
+
+    const vector = await nim.embed('where is auth', undefined, 'query');
+    assert.strictEqual(seen.length, 2, 'the 400 is retried, not surfaced');
+    assert.strictEqual(seen[0].input_type, undefined, 'the first attempt omits it');
+    assert.strictEqual(seen[1].input_type, 'query', 'the retry sends the caller\'s kind');
+    assert.strictEqual(vector.length, 3, 'and the retry\'s vector is returned');
+
+    // Learned once, not re-discovered on every call — otherwise every batch of a
+    // 100k-file build would pay a wasted 400 first.
+    await nim.embedBatch(['a chunk of code'], undefined, 'passage');
+    assert.strictEqual(seen.length, 3, 'no second probe');
+    assert.strictEqual(seen[2].input_type, 'passage', 'documents embed as passages, not queries');
+  }
+
+  // A 400 that is NOT about input_type must still surface, or a bad model id
+  // would look like an empty index.
+  {
+    const failing = new OpenAICompatibleEmbeddings({
+      id: 'x', baseUrl: 'http://x/v1', apiKey: 'k', model: 'nope',
+      fetchImpl: (async () => ({ ok: false, status: 400, text: async () => 'unknown model' })) as any,
+    });
+    await assert.rejects(() => failing.embed('hi'), /unknown model/, 'unrelated 400s are reported');
+  }
 
   // ── the store survives a reload ──────────────────────────────────
   const dir = path.join(tmp, 'index');

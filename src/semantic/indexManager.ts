@@ -109,7 +109,7 @@ export class SemanticIndexManager implements vscode.Disposable {
     // The store needs a width before the first embedding exists. One probe call
     // settles it, and it doubles as an early check that the key actually works.
     if (provider.dimensions === 0) {
-      await provider.embed('probe');
+      await provider.embed('probe', undefined, 'query');
     }
     const store = new FlatFileVectorStore({
       directory: this.indexDir,
@@ -370,7 +370,7 @@ export class SemanticIndexManager implements vscode.Disposable {
       return 0;
     }
 
-    const vectors = await this.provider!.embedBatch(chunks.map(embedText));
+    const vectors = await this.provider!.embedBatch(chunks.map(embedText), undefined, 'passage');
     await this.store!.update(rel, chunks, vectors);
     return chunks.length;
   }

@@ -32,6 +32,18 @@ export interface InfinityCoderSettings {
   providers: Provider[];
   activeModel: string;
   boostModel: string;
+  /**
+   * Model ids the user added by hand. Always offered in the picker regardless of
+   * which providers have keys: they were typed deliberately, and may be an id
+   * newer than any list we ship.
+   */
+  customModels: string[];
+  /**
+   * Model ids hidden from the picker. Kept rather than deleted so a hidden model
+   * can be brought back — and so hiding a catalog entry survives an update that
+   * would otherwise just re-add it.
+   */
+  hiddenModels: string[];
   temperature: number;
   maxTokens: number;
   /**
@@ -121,8 +133,13 @@ const DEFAULTS: InfinityCoderSettings = {
       keys: [],
     },
   ],
-  activeModel: 'minimaxai/minimax-m2.7',
-  boostModel: 'qwen/qwen3.5-397b-a17b',
+  // Both must exist in catalog.ts, which is verified against NIM's live model
+  // list. The previous defaults were ids NIM does not serve, so a fresh install
+  // failed on its first message.
+  customModels: [],
+  hiddenModels: [],
+  activeModel: 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  boostModel: 'nvidia/nemotron-3-super-120b-a12b',
   temperature: 0.7,
   maxTokens: 4096,
   maxContextTokens: 128_000,
@@ -174,6 +191,8 @@ export class SettingsStore {
       // Same reason as toolGroups: a settings blob written before a field
       // existed must gain its default rather than leave it undefined.
       semantic: { ...DEFAULTS.semantic, ...(saved.semantic || {}) },
+      customModels: saved.customModels || [],
+      hiddenModels: saved.hiddenModels || [],
     };
   }
 
@@ -315,6 +334,62 @@ export function move<T>(list: T[], index: number, delta: number): void {
  * the Models tab uses the returned ids so we never hardcode a provider's
  * catalog and get it wrong.
  */
+/**
+ * Does this provider actually serve this model id?
+ *
+ * A real one-token completion, not a `/models` lookup: plenty of endpoints list
+ * models the account cannot call, and being told a model works and then having
+ * every message fail is worse than not offering the check at all.
+ */
+export async function testModel(
+  baseUrl: string,
+  rawKey: string,
+  modelId: string
+): Promise<{ ok: boolean; message: string }> {
+  const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${rawKey}`,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (res.ok) {
+      return { ok: true, message: `OK - replied in ${Date.now() - started}ms` };
+    }
+
+    const detail = await res.text().catch(() => '');
+    // The distinction that matters: a wrong id is permanent, a 429 is not.
+    if (res.status === 404 || /model.*(not found|does not exist|unknown)/i.test(detail)) {
+      return { ok: false, message: 'Not available on this provider' };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, message: 'Key rejected for this model' };
+    }
+    if (res.status === 429) {
+      return { ok: false, message: 'Rate limited - the model exists, try again shortly' };
+    }
+    const short = detail.replace(/\s+/g, ' ').slice(0, 120);
+    return { ok: false, message: `HTTP ${res.status}${short ? ' - ' + short : ''}` };
+  } catch (e: any) {
+    return { ok: false, message: e?.name === 'AbortError' ? 'Timed out' : e?.message || 'unreachable' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function testKey(
   baseUrl: string,
   rawKey: string

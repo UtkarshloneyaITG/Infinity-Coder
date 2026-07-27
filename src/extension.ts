@@ -21,6 +21,11 @@ export function activate(context: vscode.ExtensionContext) {
   sidebarProviderInstance.attachSemanticIndex(semantic);
   void semantic.activate();
 
+  // Ask each keyed provider what it serves, so the model dropdown is populated
+  // before the user opens it. Backgrounded — it must never delay activation.
+  void sidebarProviderInstance.discoverModels();
+
+
   // Register Webview View Provider with retainContextWhenHidden: true (just like Claude extension)
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -99,13 +104,31 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.executeCommand('infinityCoder.chatView.focus');
   });
 
+  // Command: run the whole brain team on a goal. Same path the Team toggle in
+  // the chat input takes — one implementation, two entry points.
+  const runTeamCommand = vscode.commands.registerCommand('infinityCoder.runTeam', async (goal?: string) => {
+    const text =
+      goal ||
+      (await vscode.window.showInputBox({
+        title: 'Infinity Coder — Run AI Team',
+        prompt: 'What should the team build?',
+        placeHolder: 'Build authentication',
+        ignoreFocusOut: true,
+      }));
+    if (text?.trim()) {
+      await vscode.commands.executeCommand('infinityCoder.chatView.focus');
+      await sidebarProviderInstance?.sendTeamPrompt(text);
+    }
+  });
+
   context.subscriptions.push(
     startCommand,
     openChatCommand,
     explainCodeCommand,
     fixCodeCommand,
     askSelectionCommand,
-    resetChatCommand
+    resetChatCommand,
+    runTeamCommand
   );
 }
 

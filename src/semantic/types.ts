@@ -94,9 +94,18 @@ export interface EmbeddingProvider {
   readonly dimensions: number;
   /** Largest batch the provider accepts in one call. */
   readonly batchSize: number;
-  embed(text: string, signal?: AbortSignal): Promise<Float32Array>;
-  embedBatch(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>;
+  embed(text: string, signal?: AbortSignal, kind?: EmbeddingKind): Promise<Float32Array>;
+  embedBatch(texts: string[], signal?: AbortSignal, kind?: EmbeddingKind): Promise<Float32Array[]>;
 }
+
+/**
+ * Asymmetric embedding models — NVIDIA's nv-embedqa family and others — encode a
+ * short question and a long passage through different heads, and require the
+ * caller to say which it is sending. Getting it backwards does not error, it
+ * just retrieves badly, so the distinction belongs in the interface rather than
+ * buried in one provider.
+ */
+export type EmbeddingKind = 'query' | 'passage';
 
 /**
  * Vector storage. Implementations own their persistence; callers only ever see

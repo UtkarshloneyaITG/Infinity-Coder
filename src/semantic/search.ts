@@ -321,7 +321,9 @@ export class SemanticSearchEngine {
    */
   public async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
     const topK = options.topK ?? 12;
-    const vector = await this.opts.provider.embed(query, options.signal);
+    // 'query', not 'passage': on an asymmetric model these go through
+    // different heads, and mismatching them degrades every result silently.
+    const vector = await this.opts.provider.embed(query, options.signal, 'query');
     const candidates = await this.opts.store.search(vector, {
       ...options,
       topK: Math.max(topK * 4, 50),

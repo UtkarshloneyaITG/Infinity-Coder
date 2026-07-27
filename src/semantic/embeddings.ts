@@ -1,4 +1,4 @@
-import { EmbeddingProvider } from './types';
+import { EmbeddingKind, EmbeddingProvider } from './types';
 
 /**
  * Embedding providers.
@@ -51,6 +51,14 @@ export class OpenAICompatibleEmbeddings implements EmbeddingProvider {
    */
   private dims = 0;
 
+  /**
+   * Whether this endpoint requires `input_type`. Discovered from a 400 rather
+   * than configured or sniffed from the URL: the requirement belongs to the
+   * MODEL, not the provider, so the same base URL needs it for nv-embedqa and
+   * rejects it for others. One wasted request per session settles it.
+   */
+  private needsInputType: boolean | undefined;
+
   constructor(opts: OpenAICompatibleOptions) {
     this.id = opts.id;
     this.model = opts.model;
@@ -64,35 +72,79 @@ export class OpenAICompatibleEmbeddings implements EmbeddingProvider {
     return this.dims;
   }
 
-  public async embed(text: string, signal?: AbortSignal): Promise<Float32Array> {
-    const [vector] = await this.embedBatch([text], signal);
+  public async embed(
+    text: string,
+    signal?: AbortSignal,
+    kind: EmbeddingKind = 'query',
+  ): Promise<Float32Array> {
+    const [vector] = await this.embedBatch([text], signal, kind);
     return vector;
   }
 
-  public async embedBatch(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
+  public async embedBatch(
+    texts: string[],
+    signal?: AbortSignal,
+    kind: EmbeddingKind = 'passage',
+  ): Promise<Float32Array[]> {
     if (texts.length === 0) {
       return [];
     }
     const out: Float32Array[] = [];
     for (let i = 0; i < texts.length; i += this.batchSize) {
-      out.push(...await this.request(texts.slice(i, i + this.batchSize), signal));
+      out.push(...await this.request(texts.slice(i, i + this.batchSize), signal, kind));
     }
     return out;
   }
 
-  private async request(batch: string[], signal?: AbortSignal): Promise<Float32Array[]> {
+  private async request(
+    batch: string[],
+    signal: AbortSignal | undefined,
+    kind: EmbeddingKind,
+  ): Promise<Float32Array[]> {
     // An empty string embeds to garbage on some providers and 400s on others.
     const input = batch.map(t => (t.trim() ? t : ' '));
 
-    const response = await this.fetchImpl(`${this.baseUrl}/embeddings`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({ model: this.model, input, encoding_format: 'float' }),
-      signal,
-    });
+    const send = (withInputType: boolean) => {
+      const body: Record<string, unknown> = {
+        model: this.model,
+        input,
+        encoding_format: 'float',
+      };
+      if (withInputType) {
+        body.input_type = kind;
+        // NIM rejects anything over the model's window instead of truncating,
+        // and one oversized chunk would otherwise fail its whole batch.
+        body.truncate = 'END';
+      }
+      return this.fetchImpl(`${this.baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    };
+
+    let response = await send(this.needsInputType === true);
+
+    // "'input_type' parameter is required for asymmetric models". Learn it from
+    // the rejection and retry, so neither the user nor a hardcoded list of model
+    // names has to know which models are asymmetric.
+    if (!response.ok && this.needsInputType === undefined) {
+      const detail = await response.text().catch(() => '');
+      if (response.status === 400 && /input_type/i.test(detail)) {
+        this.needsInputType = true;
+        response = await send(true);
+      } else {
+        this.needsInputType = false;
+        throw new EmbeddingError(
+          `Embedding request failed (${response.status}): ${detail.slice(0, 300)}`,
+          response.status,
+        );
+      }
+    }
 
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -100,6 +152,9 @@ export class OpenAICompatibleEmbeddings implements EmbeddingProvider {
         `Embedding request failed (${response.status}): ${detail.slice(0, 300)}`,
         response.status,
       );
+    }
+    if (this.needsInputType === undefined) {
+      this.needsInputType = false;
     }
 
     const body = await response.json() as { data?: Array<{ embedding?: number[]; index?: number }> };

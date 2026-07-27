@@ -81,8 +81,8 @@ Two providers are preconfigured. Either works, or add your own:
 | Provider | Base URL | Where to get a key |
 |---|---|---|
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | [build.nvidia.com](https://build.nvidia.com) — free tier available |
-| Groq | `https://api.groq.com/openai/v1` | [console.groq.com](https://console.groq.com) |
-| Anything else | your URL | Any OpenAI-compatible endpoint: OpenRouter, Together, xAI, a local llama.cpp / Ollama server |
+| Groq | `https://api.groq.com/openai/v1` | [console.groq.com](https://console.groq.com) — free tier available |
+| Anything else | your URL | Any OpenAI-compatible endpoint: OpenRouter, Together, a local llama.cpp / Ollama server |
 
 > [!IMPORTANT]
 > Your keys are stored in your operating system's keychain via VS Code's `SecretStorage`.

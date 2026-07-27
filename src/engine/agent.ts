@@ -32,6 +32,24 @@ export interface ChatOptions {
   signal: AbortSignal;
   modelOverride?: string;
   onEvent: (event: ChatStreamEvent) => void;
+
+  // ── Multi-brain orchestration hooks ───────────────────────────────────────
+  // A brain is this same loop with a different prompt, a narrower tool set, a
+  // staged filesystem and its own provider. Injecting those four things is
+  // cheaper and far less risky than a second engine that would drift from this
+  // one's failover, streaming and context handling.
+
+  /** Replace the persona entirely. Skills and plan mode are then the caller's job. */
+  systemOverride?: string;
+  /** Restrict which tools are offered AND dispatched. Return false to withhold. */
+  toolFilter?: (name: string) => boolean;
+  /** Handle tool calls instead of the default dispatcher (used to stage writes). */
+  dispatchOverride?: (name: string, args: any, ctx: ToolContext) => Promise<string>;
+  /** Provider ids to try, in order. Empty or omitted means "all enabled providers". */
+  providerOrder?: string[];
+  /** Per-call sampling overrides, so one brain can run hot and another cold. */
+  temperature?: number;
+  maxTokens?: number;
 }
 
 /** Nothing to call with — the settings modal has no usable provider yet. */
@@ -157,18 +175,30 @@ export class Engine {
    * progressively lighter model. Key failover before model downgrade, so a spare
    * key is always preferred to a weaker model.
    */
-  private async candidates(modelOverride?: string): Promise<Candidate[]> {
+  private async candidates(modelOverride?: string, providerOrder?: string[]): Promise<Candidate[]> {
     const settings = this.settings.get();
     const primary = modelOverride || settings.activeModel;
 
     // Only downgrade through the catalog chain when the active model is IN the
-    // catalog. For an off-catalog id (a Groq or custom-endpoint model) the chain
+    // catalog. For an off-catalog id (a custom-endpoint model) the chain
     // would suggest unrelated NVIDIA models that no provider here would host.
     const models = catalogGet(primary) ? [primary, ...fallbackChain(primary)] : [primary];
 
+    // A brain's preferred providers come first; the rest stay as a last resort,
+    // because a task failing outright is worse than one answered by the user's
+    // second-choice provider.
+    const ordered = providerOrder?.length
+      ? [
+          ...providerOrder
+            .map(id => settings.providers.find(p => p.id === id))
+            .filter((p): p is (typeof settings.providers)[number] => !!p),
+          ...settings.providers.filter(p => !providerOrder.includes(p.id)),
+        ]
+      : settings.providers;
+
     const out: Candidate[] = [];
     for (const model of models) {
-      for (const provider of settings.providers) {
+      for (const provider of ordered) {
         if (!provider.enabled || provider.keys.length === 0) {
           continue;
         }
@@ -192,7 +222,7 @@ export class Engine {
 
   public async chat(opts: ChatOptions): Promise<string> {
     const settings = this.settings.get();
-    const candidates = await this.candidates(opts.modelOverride);
+    const candidates = await this.candidates(opts.modelOverride, opts.providerOrder);
     if (candidates.length === 0) {
       throw new NoCredentialsError(
         'No API key configured. Open Settings (the gear icon) and add a key under Providers.'
@@ -207,7 +237,7 @@ export class Engine {
       approve: opts.approve,
     };
     const skills = opts.skills || [];
-    const system = systemPrompt(opts.workspaceRoot, skills, opts.planMode);
+    const system = opts.systemOverride ?? systemPrompt(opts.workspaceRoot, skills, opts.planMode);
     if (skills.length > 0) {
       // Say which skills are shaping this answer — silent behaviour changes are
       // impossible to debug when a reply comes out unexpectedly different.
@@ -296,7 +326,9 @@ export class Engine {
             args = {};
           }
           opts.onEvent({ type: 'tool_call', name: call.name, input: args });
-          const output = await dispatch(call.name, args, ctx);
+          const output = opts.toolFilter && !opts.toolFilter(call.name)
+            ? `The tool '${call.name}' is not available on this turn.`
+            : await (opts.dispatchOverride || dispatch)(call.name, args, ctx);
           opts.onEvent({ type: 'tool_result', name: call.name, result: output });
           opts.history.push({ role: 'tool', tool_call_id: call.id, content: output });
         }
@@ -404,8 +436,8 @@ export class Engine {
     const body: any = {
       model: candidate.model,
       messages,
-      temperature: settings.temperature,
-      max_tokens: settings.maxTokens,
+      temperature: opts.temperature ?? settings.temperature,
+      max_tokens: opts.maxTokens ?? settings.maxTokens,
       stream: true,
       // Ask for the usage record in the final chunk. Providers that don't know
       // this option ignore it; those that do give us real token counts.
@@ -415,7 +447,14 @@ export class Engine {
     // Withholding tools is also how the wrap-up round is stopped from starting
     // the work over: it cannot call what it is not given.
     if (!suppressTools && isToolCapable(candidate.model)) {
-      const tools = toolSchemas(settings.toolGroups, opts.isTrusted, opts.planMode);
+      let tools = toolSchemas(settings.toolGroups, opts.isTrusted, opts.planMode);
+      if (opts.toolFilter) {
+        // Withholding the schema is the real gate for a brain's tool policy;
+        // the dispatch check above only catches a model calling what it was
+        // never offered.
+        const keep = opts.toolFilter;
+        tools = tools.filter((t: any) => keep(t.function?.name));
+      }
       if (tools.length > 0) {
         body.tools = tools;
       }
