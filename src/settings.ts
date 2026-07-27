@@ -57,6 +57,36 @@ export interface InfinityCoderSettings {
    * delete. 'auto' lets the agent change files unattended.
    */
   approvalMode: 'ask' | 'auto';
+  semantic: SemanticSettings;
+}
+
+/**
+ * Semantic index configuration. Off by default: it costs embedding calls, and
+ * an extension that starts spending a user's API quota the moment it installs
+ * has made that decision for them.
+ */
+export interface SemanticSettings {
+  enabled: boolean;
+  /** Provider id from `providers`, or '' to use the first one with a key. */
+  providerId: string;
+  /** Embedding model. Must match the provider — widths differ per model. */
+  model: string;
+  /** Target chunk size in characters. */
+  chunkChars: number;
+  /** Results returned by a search. */
+  topK: number;
+  /** Extra folder names to skip, on top of ALWAYS_EXCLUDED. */
+  excluded: string[];
+  /** Stop scanning after this many files. */
+  maxFiles: number;
+  /** Hard ceiling on stored chunks, so a huge repo cannot exhaust memory. */
+  maxChunks: number;
+  /** Re-index on file save/create/delete. */
+  autoUpdate: boolean;
+  /** Retrieve context automatically for every chat message. */
+  autoContext: boolean;
+  /** Token budget for automatically retrieved context. */
+  contextTokens: number;
 }
 
 /** Tool group -> tool names. Used to build the `tools` param for a turn. */
@@ -106,6 +136,21 @@ const DEFAULTS: InfinityCoderSettings = {
   // Default to asking: the first time this agent edits a real repo should not be
   // a surprise. Users who want unattended runs can switch it off in one click.
   approvalMode: 'ask',
+  semantic: {
+    enabled: false,
+    providerId: '',
+    // A widely available default. NVIDIA NIM and OpenAI both serve an embedding
+    // model under a different id, so this is the one thing a user must set.
+    model: 'nvidia/nv-embedqa-e5-v5',
+    chunkChars: 4000,
+    topK: 12,
+    excluded: [],
+    maxFiles: 100_000,
+    maxChunks: 400_000,
+    autoUpdate: true,
+    autoContext: true,
+    contextTokens: 24_000,
+  },
 };
 
 const STORAGE_KEY = 'infinityCoder.settings';
@@ -126,6 +171,9 @@ export class SettingsStore {
       // so keep any default provider the user hasn't got.
       providers: this.mergeProviders(saved.providers),
       toolGroups: { ...DEFAULTS.toolGroups, ...(saved.toolGroups || {}) },
+      // Same reason as toolGroups: a settings blob written before a field
+      // existed must gain its default rather than leave it undefined.
+      semantic: { ...DEFAULTS.semantic, ...(saved.semantic || {}) },
     };
   }
 

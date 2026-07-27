@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { InfinityCoderSidebarProvider } from './sidebarProvider';
 import { procRegistry } from './engine/tools';
 import { registerApprovalProvider } from './approval';
+import { SemanticIndexManager } from './semantic/indexManager';
+import { registerSemanticCommands } from './semantic/commands';
 
 let sidebarProviderInstance: InfinityCoderSidebarProvider | undefined;
 
@@ -10,6 +12,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   registerApprovalProvider(context);
   sidebarProviderInstance = new InfinityCoderSidebarProvider(context);
+
+  // The index owns its own state machine; activation only starts it. It is a
+  // no-op — no scan, no network — until the user enables it in Settings.
+  const semantic = new SemanticIndexManager(context, sidebarProviderInstance.settingsStore);
+  context.subscriptions.push(semantic);
+  registerSemanticCommands(context, semantic);
+  sidebarProviderInstance.attachSemanticIndex(semantic);
+  void semantic.activate();
 
   // Register Webview View Provider with retainContextWhenHidden: true (just like Claude extension)
   context.subscriptions.push(

@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ChatMessage, MessageBlock, ModelInfo, ToolInfo } from './types';
 import { SessionManager, ChatSession } from './sessionManager';
+import type { SemanticIndexManager } from './semantic/indexManager';
 import { SettingsStore, testKey, TOOL_GROUP_LABELS } from './settings';
 import { MODELS } from './catalog';
 import { Engine, Msg, NoCredentialsError, trimHistory } from './engine/agent';
@@ -39,6 +40,31 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
   private skillRegistry = new SkillRegistry();
   /** providerId -> model ids returned by a successful key Test. */
   private discoveredModels = new Map<string, string[]>();
+  /** Set once activation builds it. Absent means semantic retrieval is off. */
+  private semantic?: SemanticIndexManager;
+
+  /** Shared with the index manager so both read one settings store. */
+  public get settingsStore(): SettingsStore { return this.settings; }
+
+  public attachSemanticIndex(manager: SemanticIndexManager): void {
+    this.semantic = manager;
+    // The Index tab shows live counts, so it has to follow the manager's state
+    // rather than only refresh when the modal is opened.
+    this.context.subscriptions.push(
+      manager.onDidChangeState(() => void this.sendIndexStatsToWebview()),
+    );
+  }
+
+  private async sendIndexStatsToWebview(): Promise<void> {
+    if (!this._view) {
+      return;
+    }
+    this._view.webview.postMessage({
+      type: 'indexStats',
+      state: this.semantic?.currentState ?? 'disabled',
+      stats: (await this.semantic?.stats()) ?? null,
+    });
+  }
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.settings = new SettingsStore(context);
@@ -96,6 +122,19 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
             all: data.choice === 'applyAll',
             feedback: (data.feedback || '').trim() || undefined,
           });
+          break;
+        }
+        case 'indexCommand': {
+          const commands: Record<string, string> = {
+            build: 'infinityCoder.buildIndex',
+            update: 'infinityCoder.updateIndex',
+            clear: 'infinityCoder.clearIndex',
+          };
+          const command = commands[data.command];
+          if (command) {
+            await vscode.commands.executeCommand(command);
+            await this.sendIndexStatsToWebview();
+          }
           break;
         }
         case 'planResponse': {
@@ -586,6 +625,13 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       contextHeaderLines.push(...this.readAttachments(attachments));
     }
 
+    // Semantic retrieval. This is what removes the need to @-mention files: the
+    // index answers "what code is this message about" before the model sees it.
+    const retrieved = await this.retrieveContext(userText);
+    if (retrieved) {
+      contextHeaderLines.push(retrieved);
+    }
+
     if (contextHeaderLines.length > 0) {
       enrichedPrompt = `[VS Code Context Auto-Injected]\n${contextHeaderLines.join('\n')}\n\n[User Message]\n${userText}`;
     }
@@ -761,6 +807,43 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       this.flushStreamUpdate();
     } finally {
       this.activeAbortController = null;
+    }
+  }
+
+  /**
+   * Relevant code for this message, pulled from the semantic index.
+   *
+   * Failure is silent by design: retrieval is an enhancement, and a turn that
+   * refuses to run because the index is cold or the embedding endpoint is down
+   * would be a worse product than one that answers with less context.
+   */
+  private async retrieveContext(userText: string): Promise<string | undefined> {
+    const config = this.settings.get().semantic;
+    const engine = this.semantic?.search;
+    if (!config.enabled || !config.autoContext || !engine) {
+      return undefined;
+    }
+    // Short messages ("yes", "carry on") are about the conversation, not the
+    // codebase, and retrieving for them just burns budget on noise.
+    if (userText.trim().length < 12) {
+      return undefined;
+    }
+    try {
+      const built = await engine.buildContext(userText, {
+        maxTokens: config.contextTokens,
+        maxChunks: config.topK,
+      });
+      if (built.chunks.length === 0) {
+        return undefined;
+      }
+      const files = [...new Set(built.chunks.map(c => c.relPath))];
+      return `- Relevant code found by semantic search (${files.length} file` +
+        `${files.length === 1 ? '' : 's'}, ~${built.tokens} tokens). Read any of these ` +
+        `with read_file before changing them:
+${built.text}`;
+    } catch (e: any) {
+      console.warn(`[semantic] retrieval skipped: ${e.message}`);
+      return undefined;
     }
   }
 
@@ -2589,6 +2672,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         <button class="modal-tab" data-pane="models">Models</button>
         <button class="modal-tab" data-pane="tools">Tools</button>
         <button class="modal-tab" data-pane="skills">Skills</button>
+        <button class="modal-tab" data-pane="index">Index</button>
       </div>
 
       <div class="modal-body">
@@ -2691,6 +2775,94 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
             Only these global folders are scanned. Skills are never read from the
             open project: a SKILL.md inside a repo you cloned would be untrusted
             text turning into instructions for a model that can run commands.
+          </div>
+        </div>
+
+        <!-- Semantic index -->
+        <div class="modal-pane" id="pane-index">
+          <div class="field-hint" style="margin-bottom:10px">
+            Indexes your project into vectors so the assistant can find the right
+            code from a plain question &mdash; "where is auth handled" &mdash; instead
+            of needing @file mentions. Everything stays on disk in this extension's
+            storage; the only network calls are embedding requests to the provider
+            you pick below.
+          </div>
+
+          <label class="tool-row">
+            <input type="checkbox" id="semanticEnabled">
+            <span><b>Enable semantic indexing</b></span>
+          </label>
+          <label class="tool-row">
+            <input type="checkbox" id="semanticAutoContext">
+            <span>Retrieve context automatically for every message</span>
+          </label>
+          <label class="tool-row">
+            <input type="checkbox" id="semanticAutoUpdate">
+            <span>Keep the index current as files change</span>
+          </label>
+
+          <div class="field" style="margin-top:10px">
+            <label for="semanticProvider">Embedding provider</label>
+            <select id="semanticProvider"></select>
+            <div class="field-hint">Uses the keys you already added under Keys.</div>
+          </div>
+
+          <div class="field">
+            <label for="semanticModel">Embedding model</label>
+            <input type="text" id="semanticModel" spellcheck="false" placeholder="nvidia/nv-embedqa-e5-v5">
+            <div class="field-hint">
+              Must be an embedding model, not a chat model. Changing it discards
+              the existing index &mdash; vectors from two models are not comparable.
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="semanticTopK">Results per search</label>
+            <input type="number" id="semanticTopK" min="1" max="100" step="1">
+          </div>
+
+          <div class="field">
+            <label for="semanticChunkChars">Chunk size (characters)</label>
+            <input type="number" id="semanticChunkChars" min="500" max="20000" step="500">
+            <div class="field-hint">
+              Chunks follow syntax &mdash; a function, a class member, a heading.
+              This is the size above which one symbol is split into overlapping parts.
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="semanticContextTokens">Auto-context budget (tokens)</label>
+            <input type="number" id="semanticContextTokens" min="1000" max="200000" step="1000">
+          </div>
+
+          <div class="field">
+            <label for="semanticMaxFiles">Max files to scan</label>
+            <input type="number" id="semanticMaxFiles" min="100" max="1000000" step="1000">
+          </div>
+
+          <div class="field">
+            <label for="semanticMaxChunks">Max chunks to store</label>
+            <input type="number" id="semanticMaxChunks" min="1000" max="5000000" step="10000">
+            <div class="field-hint">
+              A ceiling, not a target. Reaching it stops indexing with a message
+              rather than exhausting memory.
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="semanticExcluded">Also exclude (comma separated)</label>
+            <input type="text" id="semanticExcluded" spellcheck="false" placeholder="fixtures, snapshots">
+            <div class="field-hint">
+              node_modules, .git, dist, build, out, coverage, vendor and friends
+              are always excluded.
+            </div>
+          </div>
+
+          <div id="semanticStats" class="skill-budget" style="margin-top:12px">Not built yet.</div>
+          <div style="display:flex; gap:8px; margin-top:6px">
+            <button class="btn-link" id="buildIndexBtn">Build index</button>
+            <button class="btn-link" id="updateIndexBtn">Update</button>
+            <button class="btn-link" id="clearIndexBtn">Clear</button>
           </div>
         </div>
 
@@ -2981,6 +3153,15 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         }
         renderHistoryMenu(msg.sessions || [], msg.activeSessionId);
         renderMessages(msg.messages || []);
+      } else if (msg.type === 'indexStats') {
+        const box = document.getElementById('semanticStats');
+        if (box) {
+          box.textContent = msg.stats
+            ? msg.stats.chunks.toLocaleString() + ' chunks - ' +
+              msg.stats.files.toLocaleString() + ' files - ' +
+              (msg.stats.bytes / 1048576).toFixed(1) + ' MB - ' + msg.state
+            : 'Not built yet' + (msg.state ? ' (' + msg.state + ')' : '') + '.';
+        }
       } else if (msg.type === 'contextUpdate') {
         if (msg.activeFileRelative) {
           activeFilePath = msg.activeFilePath;
@@ -4059,7 +4240,8 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
           maxContextTokens: parseInt(maxContextInput.value, 10) || 128000,
           maxToolRounds: parseInt(maxRoundsInput.value, 10) || 100,
           toolGroups: readToolGroups(),
-          approvalMode: approvalSelect.value
+          approvalMode: approvalSelect.value,
+          semantic: readSemanticSettings()
         }
       });
       closeSettings();
@@ -4372,7 +4554,79 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       maxContextInput.value = s.maxContextTokens;
       maxRoundsInput.value = s.maxToolRounds;
       approvalSelect.value = s.approvalMode || 'ask';
+      applySemanticSettings(s);
     }
+
+    const semanticFields = {
+      enabled: document.getElementById('semanticEnabled'),
+      autoContext: document.getElementById('semanticAutoContext'),
+      autoUpdate: document.getElementById('semanticAutoUpdate'),
+      providerId: document.getElementById('semanticProvider'),
+      model: document.getElementById('semanticModel'),
+      topK: document.getElementById('semanticTopK'),
+      chunkChars: document.getElementById('semanticChunkChars'),
+      contextTokens: document.getElementById('semanticContextTokens'),
+      maxFiles: document.getElementById('semanticMaxFiles'),
+      maxChunks: document.getElementById('semanticMaxChunks'),
+      excluded: document.getElementById('semanticExcluded'),
+    };
+
+    function applySemanticSettings(s) {
+      const sem = s.semantic || {};
+      semanticFields.enabled.checked = !!sem.enabled;
+      semanticFields.autoContext.checked = sem.autoContext !== false;
+      semanticFields.autoUpdate.checked = sem.autoUpdate !== false;
+      semanticFields.model.value = sem.model || '';
+      semanticFields.topK.value = sem.topK || 12;
+      semanticFields.chunkChars.value = sem.chunkChars || 4000;
+      semanticFields.contextTokens.value = sem.contextTokens || 24000;
+      semanticFields.maxFiles.value = sem.maxFiles || 100000;
+      semanticFields.maxChunks.value = sem.maxChunks || 400000;
+      semanticFields.excluded.value = (sem.excluded || []).join(', ');
+
+      // Rebuilt from the live provider list, so a provider added under Keys
+      // shows up here without reopening the modal.
+      const select = semanticFields.providerId;
+      select.innerHTML = '';
+      const auto = document.createElement('option');
+      auto.value = '';
+      auto.textContent = 'First provider with a key';
+      select.appendChild(auto);
+      (s.providers || []).forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        select.appendChild(opt);
+      });
+      select.value = sem.providerId || '';
+    }
+
+    function readSemanticSettings() {
+      return {
+        enabled: semanticFields.enabled.checked,
+        autoContext: semanticFields.autoContext.checked,
+        autoUpdate: semanticFields.autoUpdate.checked,
+        providerId: semanticFields.providerId.value,
+        model: semanticFields.model.value.trim(),
+        topK: parseInt(semanticFields.topK.value, 10) || 12,
+        chunkChars: parseInt(semanticFields.chunkChars.value, 10) || 4000,
+        contextTokens: parseInt(semanticFields.contextTokens.value, 10) || 24000,
+        maxFiles: parseInt(semanticFields.maxFiles.value, 10) || 100000,
+        maxChunks: parseInt(semanticFields.maxChunks.value, 10) || 400000,
+        excluded: semanticFields.excluded.value.split(',').map(x => x.trim()).filter(Boolean),
+      };
+    }
+
+    // Save before running: the command reads stored settings, so a build fired
+    // from unsaved form values would quietly use the previous provider.
+    function runIndexCommand(command) {
+      settingsAction('save', { patch: { semantic: readSemanticSettings() } });
+      vscode.postMessage({ type: 'indexCommand', command });
+    }
+
+    document.getElementById('buildIndexBtn').addEventListener('click', () => runIndexCommand('build'));
+    document.getElementById('updateIndexBtn').addEventListener('click', () => runIndexCommand('update'));
+    document.getElementById('clearIndexBtn').addEventListener('click', () => runIndexCommand('clear'));
 
     function escapeHtml(text) {
       return String(text)

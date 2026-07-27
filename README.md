@@ -114,6 +114,8 @@ Everything else:
   Shows `+added −removed`, opens a real diff on request, and lets you reject with an
   instruction ("use Tailwind instead") that goes straight back to the model.
   Switch to auto-apply in **Settings → Tools** to run unattended.
+- **Semantic index** — ask "where is authentication handled" and get the auth middleware,
+  the JWT service and the login controller, not grep hits. [See below](#semantic-index).
 - **`@file` mentions** — type `@` to search your workspace and attach files to a message.
 - **Skills** — reusable `SKILL.md` instruction files. [See below](#skills).
 - **Key & model failover** — add fallback keys per provider. A key that hits 401 or 429
@@ -172,6 +174,41 @@ always fires, one you didn't never does. Whichever skills apply are named in the
 
 `prompt:` in the frontmatter is optional: it's what `/<skill>` asks for when invoked with
 nothing after it.
+
+## Semantic index
+
+Off by default — it spends embedding calls, and that should be your decision. Turn it on
+in **Settings → Index**, set an embedding model for your provider, and press **Build
+index**.
+
+Once built, the assistant retrieves the right code by meaning before every message, so
+"fix the login bug" pulls in the login component, the auth middleware and the JWT service
+without a single `@file` mention.
+
+```
+Infinity: Build Semantic Index     full build (re-embeds everything)
+Infinity: Update Index             only files whose hash changed
+Infinity: Search Index             semantic search, jump to the result
+Infinity: Show Index Stats         chunks, files, size, model
+Infinity: Clear Index              delete it for this workspace
+```
+
+How it works, and what it costs:
+
+| | |
+|---|---|
+| **Chunking** | By syntax, never fixed windows. Functions, methods, classes, interfaces, React components and hooks come from VS Code's own symbol providers; markdown splits by heading, JSON by top-level key. Files with no language server fall back to a declaration scan. |
+| **Storage** | Flat files in the extension's storage: `manifest.json`, `vectors.bin`, `chunks.jsonl`. No database, no native modules, one index per workspace. |
+| **Memory** | Vectors are int8-quantized — a quarter the size of float32 for under 1% cosine error. Chunk *text* stays on disk and is read back only for results that are actually returned. |
+| **Incremental** | A file whose sha1 is unchanged is never re-read, re-chunked or re-embedded. Saves are debounced 2s, so a formatter or a branch switch costs one pass, not hundreds. |
+| **Ranking** | Cosine similarity, then boosts for exported symbols, entry points, config files, open editors, recency and literal name matches. Similarity dominates by design — the boosts break ties rather than replacing the vector. |
+
+Everything except the embedding request itself is local. The requests go only to the
+provider you configured, exactly like chat.
+
+**Scale.** The flat scan is comfortable to roughly 250k chunks — a large monorepo. Past
+that, `maxChunks` stops indexing with a message rather than exhausting memory; the upgrade
+path is an approximate index behind the same `VectorStore` interface, not a bigger machine.
 
 ## Security
 
