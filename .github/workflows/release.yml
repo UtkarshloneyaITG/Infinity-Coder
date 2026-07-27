@@ -1,12 +1,16 @@
 name: Build and release VSIX
 
-# Tag a commit to cut a release:  git tag v0.1.0 && git push --tags
-# The .vsix is built here and attached to the GitHub release, so users always
-# have a download link that matches the source.
+# Tag a commit to cut a release:  git tag v0.1.0 && git push origin v0.1.0
+# Or trigger manually via workflow_dispatch by specifying tag_name.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release (e.g. v0.1.0)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -19,7 +23,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
@@ -31,5 +35,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: '*.vsix'
           generate_release_notes: true
+
