@@ -81,8 +81,8 @@ Two providers are preconfigured. Either works, or add your own:
 | Provider | Base URL | Where to get a key |
 |---|---|---|
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` | [build.nvidia.com](https://build.nvidia.com) — free tier available |
-| xAI Grok | `https://api.x.ai/v1` | [console.x.ai](https://console.x.ai) |
-| Anything else | your URL | Any OpenAI-compatible endpoint: OpenRouter, Together, Groq, a local llama.cpp / Ollama server |
+| Groq | `https://api.groq.com/openai/v1` | [console.groq.com](https://console.groq.com) |
+| Anything else | your URL | Any OpenAI-compatible endpoint: OpenRouter, Together, xAI, a local llama.cpp / Ollama server |
 
 > [!IMPORTANT]
 > Your keys are stored in your operating system's keychain via VS Code's `SecretStorage`.
@@ -105,6 +105,11 @@ Two providers are preconfigured. Either works, or add your own:
 
 Everything else:
 
+- **Plan mode** — the **Plan** toggle next to the model picker. While it's on the agent
+  is offered *only* read and search tools, so it physically cannot write, delete or run
+  anything: it investigates, then posts a plan with **Approve & build** / **Change
+  something** / **Dismiss**. Approving turns the mode off and starts the work. It stays
+  on for the rest of the chat and resets in a new one.
 - **Diff approval** — every write, edit and delete pauses with a card *in the chat*.
   Shows `+added −removed`, opens a real diff on request, and lets you reject with an
   instruction ("use Tailwind instead") that goes straight back to the model.

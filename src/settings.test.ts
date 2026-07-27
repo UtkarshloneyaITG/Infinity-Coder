@@ -46,11 +46,11 @@ async function main() {
   const ctx = fakeContext();
   const store = new SettingsStore(ctx);
   const fresh = store.get();
-  assert.strictEqual(fresh.providers.length, 2, 'nvidia + xai by default');
+  assert.strictEqual(fresh.providers.length, 2, 'nvidia + groq by default');
   assert.strictEqual(fresh.providers[0].id, 'nvidia');
   assert.strictEqual(fresh.toolGroups.web, true);
 
-  // A settings blob from an older version, missing the xai provider and the
+  // A settings blob from an older version, missing the groq provider and the
   // web tool group, must gain both instead of losing what it does have.
   await store.save({
     ...fresh,

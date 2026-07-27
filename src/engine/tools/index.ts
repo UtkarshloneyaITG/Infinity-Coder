@@ -42,14 +42,41 @@ const UNTRUSTED_MESSAGE =
   'This workspace is not trusted, so shell commands are disabled. The user can ' +
   'enable them with "Workspaces: Manage Workspace Trust" in the command palette.';
 
+const PLAN_MODE_MESSAGE =
+  'Plan mode is on, so this tool is unavailable — nothing may be changed yet. ' +
+  'Keep investigating with the read-only tools and present your plan for approval.';
+
+/**
+ * The tools plan mode allows. An allowlist rather than a list of mutating tools,
+ * so a tool added later is withheld until someone has decided it is read-only —
+ * the failure is "plan mode is too strict", never "plan mode edited the project".
+ *
+ * run_command is excluded even though plenty of commands only read: the argument
+ * is free-form text, so allowing it would put the entire gate on the model's
+ * judgement about its own command string.
+ */
+const PLAN_MODE_TOOLS = new Set([
+  'read_file', 'list_folder',
+  'find_files', 'search_in_files',
+  'list_processes',
+  'web_search', 'read_page', 'extract_links',
+]);
+
 /**
  * OpenAI `tools` array for the enabled groups. Omitting a tool here is the real
  * gate — a tool that is never offered cannot be called. `dispatch` re-checks
  * anyway, since a model can emit a tool name it was never given.
  */
-export function toolSchemas(enabledGroups?: Record<string, boolean>, isTrusted = true): any[] {
+export function toolSchemas(
+  enabledGroups?: Record<string, boolean>,
+  isTrusted = true,
+  planMode = false
+): any[] {
   const tools = ALL_TOOLS.filter(t => {
     if (t.group === 'shell' && !isTrusted) {
+      return false;
+    }
+    if (planMode && !PLAN_MODE_TOOLS.has(t.name)) {
       return false;
     }
     return enabledGroups ? enabledGroups[t.group] !== false : true;
@@ -73,6 +100,11 @@ export async function dispatch(name: string, args: any, ctx: ToolContext): Promi
   }
   if (tool.group === 'shell' && !ctx.isTrusted) {
     return UNTRUSTED_MESSAGE;
+  }
+  // Withholding the schema is the real gate, but a model can call a tool it was
+  // never offered — and in plan mode that call would be a write to the project.
+  if (ctx.planMode && !PLAN_MODE_TOOLS.has(tool.name)) {
+    return PLAN_MODE_MESSAGE;
   }
   try {
     return String(await tool.run(args || {}, ctx));

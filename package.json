@@ -28,7 +28,7 @@
     "agent",
     "openai",
     "nvidia",
-    "grok",
+    "groq",
     "code-assistant"
   ],
   "categories": [

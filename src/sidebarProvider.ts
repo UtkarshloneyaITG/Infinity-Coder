@@ -83,7 +83,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
         case 'sendMessage': {
-          await this.handleUserMessage(data.text, data.model, data.attachments, data.skills);
+          await this.handleUserMessage(data.text, data.model, data.attachments, data.skills, data.planMode);
           break;
         }
         case 'searchFiles': {
@@ -96,6 +96,10 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
             all: data.choice === 'applyAll',
             feedback: (data.feedback || '').trim() || undefined,
           });
+          break;
+        }
+        case 'planResponse': {
+          await this.handlePlanResponse(data.id, data.choice);
           break;
         }
         case 'viewDiff': {
@@ -281,6 +285,29 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     }
     this.currentSession = this.reviveSession(next);
     this.sendSessionsToWebview();
+  }
+
+  /**
+   * Answer a plan. Unlike an approval card this settles no promise — the turn
+   * that wrote the plan is long over — so a plan stays answerable across a
+   * reload, and approving is simply the next message with plan mode off.
+   */
+  private async handlePlanResponse(messageId: string, choice: 'approve' | 'dismiss') {
+    const msg = this.currentSession.messages.find(m => m.id === messageId);
+    if (!msg || msg.plan !== 'pending') {
+      return; // already answered, or answered in another window
+    }
+    msg.plan = choice === 'approve' ? 'approved' : 'dismissed';
+    this.sessionManager.saveSession(this.currentSession);
+    this.sendSessionsToWebview();
+
+    if (choice === 'approve') {
+      await this.handleUserMessage(
+        'Implement the plan above. Follow it step by step, and tell me if you have ' +
+        'to depart from it.',
+        this.activeModel
+      );
+    }
   }
 
   /**
@@ -525,7 +552,8 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     userText: string,
     modelOverride?: string,
     attachments?: string[],
-    forcedSkills?: string[]
+    forcedSkills?: string[],
+    planMode?: boolean
   ) {
     const userMsgId = `user-${Date.now()}`;
     const assistantMsgId = `asst-${Date.now()}`;
@@ -612,6 +640,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         // Selected from the user's raw message, not the context-enriched prompt:
         // the injected workspace header would otherwise skew every score.
         skills: this.selectSkillsFor(userText, forcedSkills),
+        planMode,
         approve: this.settings.get().approvalMode === 'auto' ? undefined : approve,
         signal: this.activeAbortController.signal,
         modelOverride: modelOverride || undefined,
@@ -696,6 +725,11 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       const msg = this.currentSession.messages.find(m => m.id === assistantMsgId);
       if (msg) {
         msg.streaming = false;
+        // Only a plan that actually says something is answerable — an aborted or
+        // empty turn must not leave an Approve button with nothing behind it.
+        if (planMode && !msg.error && (msg.content || answer)) {
+          msg.plan = 'pending';
+        }
         // A turn can end with tool calls and no streamed text (some models emit
         // the summary only in the final round); fall back to the returned answer.
         if (answer && !msg.content) {
@@ -1771,6 +1805,82 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       color: var(--accent-strong);
     }
 
+    .plan-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: var(--bg);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 0.73rem;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .plan-toggle:hover { border-color: var(--border-bright); }
+
+    .plan-toggle-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      opacity: 0.5;
+    }
+
+    /* On is a state the user must not lose track of — every following message is
+       read-only until they turn it off, so it stays loud rather than subtle. */
+    .plan-toggle.on {
+      color: var(--accent-strong);
+      border-color: var(--accent-strong);
+      background: color-mix(in srgb, var(--accent-strong) 12%, transparent);
+    }
+
+    .plan-toggle.on .plan-toggle-dot {
+      background: var(--accent-strong);
+      opacity: 1;
+    }
+
+    .plan-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 10px 0 2px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+    }
+
+    .plan-btn {
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 5px 10px;
+      font-size: 0.7rem;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .plan-btn:hover {
+      background: var(--hover-bg);
+      border-color: var(--border-bright);
+    }
+
+    .plan-btn.primary {
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+      color: var(--accent-fg);
+    }
+
+    .plan-answered {
+      margin: 10px 0 2px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      font-size: 0.68rem;
+      color: var(--text-dim);
+    }
+
     .model-select-inline {
       background: var(--bg);
       color: var(--text-dim);
@@ -2661,6 +2771,9 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
           <span id="attachChips"></span>
         </div>
         <div class="input-card-right">
+          <button class="plan-toggle" id="planToggle" title="Plan mode — investigate and propose a plan, change nothing">
+            <span class="plan-toggle-dot"></span>Plan
+          </button>
           <select class="model-select-inline" id="modelSelect" title="Select Model">
             <option value="">Connecting...</option>
           </select>
@@ -2683,6 +2796,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     const landingView = document.getElementById('landingView');
     const messagesContainer = document.getElementById('messagesContainer');
     const promptInput = document.getElementById('promptInput');
+    const planToggle = document.getElementById('planToggle');
     const sendBtn = document.getElementById('sendBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const settingsBtn = document.getElementById('settingsBtn');
@@ -2859,6 +2973,12 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
           });
         }
       } else if (msg.type === 'sessionsUpdate') {
+        // A different thread means plan mode starts off again. This fires on
+        // every stream flush too, so it has to key off the id actually changing.
+        if (msg.activeSessionId !== shownSessionId) {
+          shownSessionId = msg.activeSessionId;
+          setPlanMode(false);
+        }
         renderHistoryMenu(msg.sessions || [], msg.activeSessionId);
         renderMessages(msg.messages || []);
       } else if (msg.type === 'contextUpdate') {
@@ -3333,7 +3453,8 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         text,
         model: modelSelect.value,
         attachments: attachedFiles.map(f => f.path),
-        skills: pinnedSkills.slice()
+        skills: pinnedSkills.slice(),
+        planMode
       });
       promptInput.value = '';
       attachedFiles = [];
@@ -3575,6 +3696,10 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
           div.appendChild(loader);
         }
 
+        if (m.plan && !m.streaming) {
+          div.appendChild(renderPlanActions(m));
+        }
+
         if (m.usage && !m.streaming) {
           div.appendChild(renderUsage(m.usage));
         }
@@ -3585,6 +3710,76 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
       updateSendBtnState(hasActiveStream);
       updateStreamStatus(messages);
       mainContent.scrollTop = mainContent.scrollHeight;
+    }
+
+    // ── Plan mode ────────────────────────────────────────────────────
+    // On until the user turns it off or approves a plan, and reset whenever the
+    // thread changes: carrying it into a different chat silently would make the
+    // next message do nothing anyone asked for.
+    let planMode = false;
+    let shownSessionId = null;
+
+    function setPlanMode(on) {
+      planMode = !!on;
+      planToggle.classList.toggle('on', planMode);
+      planToggle.setAttribute('aria-pressed', planMode ? 'true' : 'false');
+      promptInput.placeholder = planMode
+        ? 'Plan mode — describe the task, nothing will be changed...'
+        : 'ctrl esc to focus or ask Infinity Coder...';
+    }
+
+    planToggle.addEventListener('click', () => setPlanMode(!planMode));
+
+    // Answered locally the moment it is clicked, for the same reason approvals
+    // are: the buttons must stop looking clickable without waiting for a
+    // round-trip, and approving starts a whole turn.
+    const answeredPlans = {};
+
+    function renderPlanActions(m) {
+      const status = answeredPlans[m.id] || m.plan;
+
+      if (status !== 'pending') {
+        const done = document.createElement('div');
+        done.className = 'plan-answered';
+        done.textContent = status === 'approved' ? 'Plan approved.' : 'Plan dismissed.';
+        return done;
+      }
+
+      const bar = document.createElement('div');
+      bar.className = 'plan-actions';
+
+      const answer = (choice) => {
+        answeredPlans[m.id] = choice === 'approve' ? 'approved' : 'dismissed';
+        bar.querySelectorAll('button').forEach(b => { b.disabled = true; });
+        if (choice === 'approve') { setPlanMode(false); }
+        vscode.postMessage({ type: 'planResponse', id: m.id, choice });
+      };
+
+      const approve = document.createElement('button');
+      approve.className = 'plan-btn primary';
+      approve.textContent = 'Approve & build';
+      approve.addEventListener('click', () => answer('approve'));
+      bar.appendChild(approve);
+
+      // Not a rejection: it hands the plan back to the input so the user can say
+      // what to change, with plan mode still on so the revision is also a plan.
+      const edit = document.createElement('button');
+      edit.className = 'plan-btn';
+      edit.textContent = 'Change something';
+      edit.addEventListener('click', () => {
+        promptInput.value = 'Revise the plan: ';
+        promptInput.focus();
+        promptInput.selectionStart = promptInput.selectionEnd = promptInput.value.length;
+      });
+      bar.appendChild(edit);
+
+      const dismiss = document.createElement('button');
+      dismiss.className = 'plan-btn';
+      dismiss.textContent = 'Dismiss';
+      dismiss.addEventListener('click', () => answer('dismiss'));
+      bar.appendChild(dismiss);
+
+      return bar;
     }
 
     // ── Inline change approval ───────────────────────────────────────

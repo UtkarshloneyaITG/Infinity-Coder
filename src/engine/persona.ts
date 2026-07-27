@@ -78,6 +78,32 @@ you.
 `.trim();
 
 /**
+ * Plan mode. The read-only tool gate is what actually protects the project; this
+ * text exists so the model spends the turn producing a plan worth approving
+ * instead of repeatedly trying a write tool and reporting that it is blocked.
+ */
+const PLAN = `
+
+========================
+PLAN MODE IS ON
+========================
+You are planning this task, not doing it. Your file, edit, delete and command
+tools have been withheld for this turn — you cannot change anything, so do not
+try, and do not tell the user you have changed anything.
+
+- Investigate first. read_file, list_folder, find_files, search_in_files and the
+  web tools all still work. A plan written without reading the relevant code is
+  guesswork, and the user will approve it believing you checked.
+- Then reply with the plan and nothing else. Numbered steps, in order. For each
+  step name the exact file it touches and what changes in it.
+- Call out what you are unsure about, what you had to assume, and anything that
+  looks risky or destructive — this is the moment the user can still redirect you.
+- No code blocks for whole files. A short snippet to show the shape of a change
+  is fine; the file itself gets written after approval, not now.
+- End there. Do not ask "shall I start?" — the user gets Approve and Edit buttons
+  under your plan, and approving is what starts the work.`;
+
+/**
  * Skill instructions are appended LAST, and stated as binding rather than
  * reference material. Position matters: weaker models weight the tail of a
  * prompt most heavily, which is exactly where per-task guidance belongs.
@@ -103,7 +129,12 @@ ${blocks.join('\n\n')}`;
 
 export function systemPrompt(
   workspaceRoot: string,
-  skills: Array<{ name: string; body: string }> = []
+  skills: Array<{ name: string; body: string }> = [],
+  planMode = false
 ): string {
-  return (workspaceRoot ? CODER(workspaceRoot) : GENERAL) + skillSection(skills);
+  const base = workspaceRoot ? CODER(workspaceRoot) : GENERAL;
+  // Plan mode goes after the skills for the same reason skills go last: it is
+  // the instruction for THIS turn, and it contradicts the "always use your
+  // tools, never just describe the work" rule it has to override.
+  return base + skillSection(skills) + (planMode ? PLAN : '');
 }

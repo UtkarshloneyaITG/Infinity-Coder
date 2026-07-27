@@ -27,6 +27,8 @@ export interface ChatOptions {
   skills?: Array<{ name: string; body: string; reason: 'always' | 'auto' | 'command' }>;
   /** Omitted in auto-approve mode; see ToolContext.approve. */
   approve?: ToolContext['approve'];
+  /** Plan mode: read-only tools only, and the prompt asks for a plan. */
+  planMode?: boolean;
   signal: AbortSignal;
   modelOverride?: string;
   onEvent: (event: ChatStreamEvent) => void;
@@ -160,7 +162,7 @@ export class Engine {
     const primary = modelOverride || settings.activeModel;
 
     // Only downgrade through the catalog chain when the active model is IN the
-    // catalog. For an off-catalog id (a Grok or custom-endpoint model) the chain
+    // catalog. For an off-catalog id (a Groq or custom-endpoint model) the chain
     // would suggest unrelated NVIDIA models that no provider here would host.
     const models = catalogGet(primary) ? [primary, ...fallbackChain(primary)] : [primary];
 
@@ -201,10 +203,11 @@ export class Engine {
       workspaceRoot: opts.workspaceRoot,
       logDir: opts.logDir,
       isTrusted: opts.isTrusted,
+      planMode: opts.planMode,
       approve: opts.approve,
     };
     const skills = opts.skills || [];
-    const system = systemPrompt(opts.workspaceRoot, skills);
+    const system = systemPrompt(opts.workspaceRoot, skills, opts.planMode);
     if (skills.length > 0) {
       // Say which skills are shaping this answer — silent behaviour changes are
       // impossible to debug when a reply comes out unexpectedly different.
@@ -412,7 +415,7 @@ export class Engine {
     // Withholding tools is also how the wrap-up round is stopped from starting
     // the work over: it cannot call what it is not given.
     if (!suppressTools && isToolCapable(candidate.model)) {
-      const tools = toolSchemas(settings.toolGroups, opts.isTrusted);
+      const tools = toolSchemas(settings.toolGroups, opts.isTrusted, opts.planMode);
       if (tools.length > 0) {
         body.tools = tools;
       }

@@ -22,6 +22,11 @@ export interface ToolContext {
    */
   isTrusted: boolean;
   /**
+   * Plan mode: the turn may look but not touch. Only the read-only tools are
+   * offered, and `dispatch` refuses the rest even if the model asks anyway.
+   */
+  planMode?: boolean;
+  /**
    * Ask the user to approve a file change. Absent in auto-approve mode (and in
    * tests), which means "go ahead" — so a tool that forgets to call it fails open
    * rather than blocking, and the gate that actually decides is whether the

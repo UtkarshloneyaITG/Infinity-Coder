@@ -84,9 +84,9 @@ const DEFAULTS: InfinityCoderSettings = {
       keys: [],
     },
     {
-      id: 'xai',
-      name: 'xAI Grok',
-      baseUrl: 'https://api.x.ai/v1',
+      id: 'groq',
+      name: 'Groq',
+      baseUrl: 'https://api.groq.com/openai/v1',
       enabled: true,
       keys: [],
     },

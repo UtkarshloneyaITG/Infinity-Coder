@@ -293,6 +293,32 @@ async function main() {
     'the other groups still work in an untrusted workspace'
   );
 
+  // ── plan mode is read-only ───────────────────────────────────────
+  // The whole promise of the feature: while planning, nothing can be changed.
+  const planSchemas = toolSchemas(undefined, true, true);
+  const planNames = planSchemas.map((t: any) => t.function.name);
+  for (const mutating of ['write_file', 'edit_file', 'create_item', 'delete_item', 'run_command', 'stop_process']) {
+    assert.ok(!planNames.includes(mutating), `plan mode must not offer ${mutating}`);
+  }
+  for (const readonly of ['read_file', 'list_folder', 'find_files', 'search_in_files', 'web_search']) {
+    assert.ok(planNames.includes(readonly), `plan mode still needs ${readonly} to investigate`);
+  }
+  // A tool added later is withheld until it is explicitly declared read-only,
+  // so the allowlist failing open is itself a test failure.
+  assert.ok(planNames.length < ALL_TOOLS.length, 'plan mode withholds something');
+
+  const planCtx = { ...ctx, planMode: true };
+  const planTarget = path.join(tmp, 'plan-guard.txt');
+  out = await dispatch('write_file', { path: planTarget, content: 'nope' }, planCtx);
+  assert.ok(out.includes('Plan mode'), 'dispatch refuses a write the model asked for anyway');
+  assert.ok(!fs.existsSync(planTarget), 'plan mode must not have created the file');
+  out = await dispatch('run_command', { command: 'echo pwned' }, planCtx);
+  assert.ok(out.includes('Plan mode'), 'plan mode refuses commands');
+  out = await dispatch('bash', { command: 'echo pwned' }, planCtx);
+  assert.ok(out.includes('Plan mode'), 'the alias path is gated too');
+  out = await dispatch('read_file', { path: 'edit.txt' }, planCtx);
+  assert.ok(out.includes('BETA'), 'reading still works while planning');
+
   // Defence in depth: a model can name a tool it was never offered.
   const untrustedCtx = { ...ctx, isTrusted: false };
   out = await dispatch('run_command', { command: 'echo pwned' }, untrustedCtx);

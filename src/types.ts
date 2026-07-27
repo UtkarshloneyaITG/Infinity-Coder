@@ -48,6 +48,12 @@ export interface ChatMessage {
   usage?: UsageInfo;
   streaming?: boolean;
   error?: boolean;
+  /**
+   * This reply is a plan produced in plan mode, so it gets the Approve / Edit
+   * bar. Cleared once answered, which is what stops an old plan in the scrolled-
+   * back history from still looking actionable.
+   */
+  plan?: 'pending' | 'approved' | 'dismissed';
 }
 
 export interface UsageInfo {

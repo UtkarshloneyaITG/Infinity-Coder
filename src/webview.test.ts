@@ -187,6 +187,7 @@ async function main() {
             renderAttachChips, renderSkillChips, skillCommands } = deps;
     let pinnedSkills = [];
     let attachedFiles = [];
+    let planMode = deps.planMode || false;
     ${sendSource}
     return { sendMessage, executeSlashCmd };
   `);
@@ -207,6 +208,26 @@ async function main() {
     }));
     return sent;
   };
+
+  // Plan mode has to reach the extension, or the toggle is decorative and the
+  // agent quietly edits files while the user thinks it is only planning.
+  const planned = ((): any[] => {
+    const sentInPlan: any[] = [];
+    buildHarness({
+      promptInput: { value: 'add dark mode', focus() {}, selectionStart: 0 },
+      vscode: { postMessage: (m: any) => sentInPlan.push(m) },
+      modelSelect: { value: 'm' },
+      hideSlashMenu() {}, hideFileMenu() {}, renderAttachChips() {}, renderSkillChips() {},
+      skillCommands: [],
+      planMode: true,
+    }).sendMessage();
+    return sentInPlan;
+  })();
+  assert.strictEqual(planned[0].planMode, true, 'plan mode is sent with the message');
+  assert.ok(html.includes('id="planToggle"'), 'the plan toggle exists in the panel');
+  for (const needle of ['renderPlanActions', 'planResponse', 'setPlanMode']) {
+    assert.ok(inline!.includes(needle), `plan mode is missing: ${needle}`);
+  }
 
   // Clicking a skill with an empty box sends straight away.
   let sent = fire('', api => api.executeSlashCmd('/ponytail-review'));

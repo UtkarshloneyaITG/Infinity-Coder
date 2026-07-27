@@ -4,7 +4,7 @@
  * Ported from the Python backend's brain/catalog.py. This is the OFFLINE
  * default: the Models tab merges it with whatever `GET /models` returns live
  * for each provider that has a working key, so a provider whose ids we don't
- * hardcode (xAI, custom endpoints) still gets a populated dropdown.
+ * hardcode (Groq, custom endpoints) still gets a populated dropdown.
  */
 
 export type Tier = 'heavy' | 'medium' | 'low';
@@ -50,7 +50,7 @@ export function get(modelId: string): CatalogModel | undefined {
 
 /**
  * Whether a model can call tools. Unknown (off-catalog, e.g. live-discovered)
- * models default to true, so a Grok or custom-endpoint model isn't crippled
+ * models default to true, so a Groq or custom-endpoint model isn't crippled
  * just because it isn't in the static list.
  */
 export function isToolCapable(modelId: string): boolean {
