@@ -1,0 +1,35 @@
+name: Build and release VSIX
+
+# Tag a commit to cut a release:  git tag v0.1.0 && git push --tags
+# The .vsix is built here and attached to the GitHub release, so users always
+# have a download link that matches the source.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # The self-checks gate the release: a broken build never ships a .vsix.
+      - run: npm test
+
+      - run: npx --yes @vscode/vsce package
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '*.vsix'
+          generate_release_notes: true

@@ -1,0 +1,129 @@
+{
+  "name": "infinity-coder",
+  "displayName": "Infinity Coder",
+  "description": "Self-contained AI coding agent for VS Code. Bring your own OpenAI-compatible API key — no backend server, no telemetry, no dependencies.",
+  "version": "0.1.0",
+  "publisher": "infinity-coder",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/UtkarshloneyaITG/Infinity-Coder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/UtkarshloneyaITG/Infinity-Coder/issues"
+  },
+  "homepage": "https://github.com/UtkarshloneyaITG/Infinity-Coder#readme",
+  "keywords": [
+    "ai",
+    "chat",
+    "copilot",
+    "agent",
+    "openai",
+    "nvidia",
+    "grok",
+    "code-assistant"
+  ],
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "infinityCoder.start",
+        "title": "Infinity Coder: Start AI Assistant",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "infinityCoder.openChat",
+        "title": "Infinity Coder: Open Chat View",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "infinityCoder.explainCode",
+        "title": "Infinity Coder: Explain Selected Code",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "infinityCoder.fixCode",
+        "title": "Infinity Coder: Fix / Refactor Selected Code",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "infinityCoder.askSelection",
+        "title": "Infinity Coder: Ask AI About Selected Code",
+        "icon": "$(question)"
+      },
+      {
+        "command": "infinityCoder.resetChat",
+        "title": "Infinity Coder: Clear Conversation",
+        "icon": "$(clear-all)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "infinityCoder.openChat",
+        "key": "ctrl+alt+b",
+        "mac": "cmd+alt+b"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "infinityCoder.explainCode",
+          "group": "infinity-coder@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "infinityCoder.fixCode",
+          "group": "infinity-coder@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "infinityCoder.askSelection",
+          "group": "infinity-coder@3",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "infinity-coder-sidebar",
+          "title": "Infinity Coder",
+          "icon": "assets/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "infinity-coder-sidebar": [
+        {
+          "type": "webview",
+          "id": "infinityCoder.chatView",
+          "name": "Infinity Coder Chat",
+          "visibility": "visible"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package",
+    "pretest": "npm run compile",
+    "test": "node out/settings.test.js && node out/engine/engine.test.js && node out/engine/skills.test.js && node out/webview.test.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
