@@ -4,6 +4,11 @@
   "description": "Self-contained AI coding agent for VS Code. Bring your own OpenAI-compatible API key — no backend server, no telemetry, no dependencies.",
   "version": "0.1.0",
   "publisher": "infinity-coder",
+  "icon": "assets/icon.png",
+  "galleryBanner": {
+    "color": "#1c1c1c",
+    "theme": "dark"
+  },
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"

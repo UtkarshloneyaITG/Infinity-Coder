@@ -5,7 +5,11 @@
 src/**
 tsconfig.json
 package-lock.json
+.gitignore
 *.vsix
+
+# Logo master art. assets/icon.png and assets/icon.svg are derived from it.
+element*.svg
 
 # Source maps point at src/, which is not shipped — so they are dead weight.
 **/*.map

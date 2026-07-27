@@ -1,10 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M12 2L15 9L22 12L15 15L12 22L9 15L2 12L9 9Z" fill="url(#grad)" stroke="none"/>
-  <circle cx="12" cy="12" r="3" fill="#ffffff"/>
-  <defs>
-    <linearGradient id="grad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#cba6f7"/>
-      <stop offset="1" stop-color="#89b4fa"/>
-    </linearGradient>
-  </defs>
+<!-- Activity-bar icon. VS Code masks this to a single theme colour, so it is
+     stroke-only line art: the braces + infinity mark from assets/icon.png. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+     fill="none" stroke="currentColor" stroke-width="1.5"
+     stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.2 3.5h-.7a1.5 1.5 0 0 0-1.5 1.5v4a2 2 0 0 1-1.5 2 2 2 0 0 1 1.5 2v4a1.5 1.5 0 0 0 1.5 1.5h.7"/>
+  <path d="M18.8 3.5h.7a1.5 1.5 0 0 1 1.5 1.5v4a2 2 0 0 0 1.5 2 2 2 0 0 0-1.5 2v4a1.5 1.5 0 0 1-1.5 1.5h-.7"/>
+  <g transform="translate(12 12) scale(.62) translate(-12 -12)">
+    <path d="M12 12c-2-2.67-4-4-6-4a4 4 0 1 0 0 8c2 0 4-1.33 6-4Zm0 0c2 2.67 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.33-6 4Z"/>
+  </g>
 </svg>

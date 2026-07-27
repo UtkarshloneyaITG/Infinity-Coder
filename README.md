@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/UtkarshloneyaITG/Infinity-Coder/main/assets/icon-256.png" alt="" width="96" height="96">
+
 # Infinity Coder
 
 **A self-contained AI coding agent for Visual Studio Code.**
