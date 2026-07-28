@@ -33,6 +33,10 @@ export interface ToolContext {
    * caller supplies this at all.
    */
   approve?: (request: ApprovalRequest) => Promise<ApprovalVerdict>;
+  /** Absolute paths that arrived in this turn through semantic retrieval. */
+  ragFiles?: Set<string>;
+  /** Successful read_file windows in this turn, keyed by absolute file path. */
+  readRanges?: Map<string, Array<{ startLine: number; endLine: number }>>;
 }
 
 export interface ApprovalRequest {

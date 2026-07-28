@@ -27,6 +27,8 @@ export interface ChatOptions {
   skills?: Array<{ name: string; body: string; reason: 'always' | 'auto' | 'command' }>;
   /** Omitted in auto-approve mode; see ToolContext.approve. */
   approve?: ToolContext['approve'];
+  /** Absolute files included in semantic context for this turn. */
+  ragFiles?: string[];
   /** Plan mode: read-only tools only, and the prompt asks for a plan. */
   planMode?: boolean;
   signal: AbortSignal;
@@ -235,6 +237,8 @@ export class Engine {
       isTrusted: opts.isTrusted,
       planMode: opts.planMode,
       approve: opts.approve,
+      ragFiles: opts.ragFiles?.length ? new Set(opts.ragFiles) : undefined,
+      readRanges: new Map(),
     };
     const skills = opts.skills || [];
     const system = opts.systemOverride ?? systemPrompt(opts.workspaceRoot, skills, opts.planMode);

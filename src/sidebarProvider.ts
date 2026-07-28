@@ -868,7 +868,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
     // index answers "what code is this message about" before the model sees it.
     const retrieved = await this.retrieveContext(userText);
     if (retrieved) {
-      contextHeaderLines.push(retrieved);
+      contextHeaderLines.push(retrieved.text);
     }
 
     if (contextHeaderLines.length > 0) {
@@ -953,6 +953,7 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         skills: this.selectSkillsFor(userText, forcedSkills),
         planMode,
         approve: this.settings.get().approvalMode === 'auto' ? undefined : approve,
+        ragFiles: retrieved?.files.map(file => path.resolve(workspacePath || '', file)),
         signal: this.activeAbortController.signal,
         modelOverride: modelOverride || undefined,
         onEvent: (event) => {
@@ -1082,7 +1083,9 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
    * refuses to run because the index is cold or the embedding endpoint is down
    * would be a worse product than one that answers with less context.
    */
-  private async retrieveContext(userText: string): Promise<string | undefined> {
+  private async retrieveContext(
+    userText: string,
+  ): Promise<{ text: string; files: string[] } | undefined> {
     const config = this.settings.get().semantic;
     const engine = this.semantic?.search;
     if (!config.enabled || !config.autoContext || !engine) {
@@ -1102,10 +1105,13 @@ export class InfinityCoderSidebarProvider implements vscode.WebviewViewProvider 
         return undefined;
       }
       const files = [...new Set(built.chunks.map(c => c.relPath))];
-      return `- Relevant code found by semantic search (${files.length} file` +
-        `${files.length === 1 ? '' : 's'}, ~${built.tokens} tokens). Read any of these ` +
-        `with read_file before changing them:
-${built.text}`;
+      return {
+        files,
+        text: `- Relevant code found by semantic search (${files.length} file` +
+          `${files.length === 1 ? '' : 's'}, ~${built.tokens} tokens). Read any of these ` +
+          `with read_file before changing them:
+${built.text}`,
+      };
     } catch (e: any) {
       console.warn(`[semantic] retrieval skipped: ${e.message}`);
       return undefined;

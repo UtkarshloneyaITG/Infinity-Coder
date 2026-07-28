@@ -220,6 +220,26 @@ async function main() {
   out = await dispatch('edit_file', { path: 'edit.txt' }, ctx);
   assert.ok(out.includes('Tell me what to change'), 'an edit with no mode asks rather than no-ops silently');
 
+  // Semantic context helps locate code but can be stale or formatted differently.
+  // A RAG-sourced file therefore needs a fresh read around the actual edit before
+  // edit_file can write it. The guard applies only to this RAG-marked context.
+  const ragLines = Array.from({ length: 1000 }, (_, i) => i === 799 ? 'TARGET = old;' : `line${i + 1}`);
+  fs.writeFileSync(path.join(tmp, 'rag.txt'), ragLines.join('\n'));
+  const ragCtx = {
+    ...ctx,
+    ragFiles: new Set([path.join(tmp, 'rag.txt')]),
+    readRanges: new Map<string, Array<{ startLine: number; endLine: number }>>(),
+  };
+  out = await dispatch('edit_file', { path: 'rag.txt', old_text: 'TARGET = old;', new_text: 'TARGET = fresh;' }, ragCtx);
+  assert.ok(out.includes('Before editing RAG-retrieved code'), out);
+  assert.ok(out.includes('offset=600') && out.includes('max_lines=401'), out);
+  assert.ok(fs.readFileSync(path.join(tmp, 'rag.txt'), 'utf8').includes('TARGET = old;'), 'guard leaves the file untouched');
+  out = await dispatch('read_file', { path: 'rag.txt', offset: 600, max_lines: 401 }, ragCtx);
+  assert.ok(out.includes('TARGET = old;'), 'the required current context is readable');
+  out = await dispatch('edit_file', { path: 'rag.txt', old_text: 'TARGET = old;', new_text: 'TARGET = fresh;' }, ragCtx);
+  assert.ok(out.includes('Replaced 1'), out);
+  assert.ok(fs.readFileSync(path.join(tmp, 'rag.txt'), 'utf8').includes('TARGET = fresh;'), 'freshly read RAG code can be edited');
+
   // ── create / list ────────────────────────────────────────────────
   out = await dispatch('create_item', { path: 'sub', type: 'folder' }, ctx);
   assert.ok(out.includes('Created the folder'), out);

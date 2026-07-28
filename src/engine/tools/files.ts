@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolSpec, normalizePath, looksBinary, errText, approved, rejectionMessage } from './common';
+import { ToolSpec, ToolContext, normalizePath, looksBinary, errText, approved, rejectionMessage } from './common';
 
 /**
  * File tools: read, write, edit, create, delete, list.
@@ -15,12 +15,70 @@ const MAX_CHARS = 20_000;      // hard cap on the text returned by one call
 const MAX_READ_BYTES = 5_000_000;
 const MAX_EDIT_BYTES = 5_000_000;
 const MAX_NAMES = 60;          // names listed by list_folder
+const RAG_EDIT_CONTEXT_LINES = 200;
 
 // Overwrite truncation guard. Below this many lines a file is small enough that
 // a rewrite is unremarkable; above it, collapsing to under this fraction of the
 // original almost always means the model rewrote from a partial read.
 const TRUNCATE_GUARD_MIN_LINES = 20;
 const TRUNCATE_GUARD_RATIO = 0.3;
+
+/** Remember exactly what the model saw, so an edit can require fresh context. */
+function rememberReadRange(ctx: ToolContext, target: string, startLine: number, endLine: number): void {
+  if (endLine < startLine) { return; }
+  const ranges = ctx.readRanges || (ctx.readRanges = new Map());
+  const fileRanges = ranges.get(target) || [];
+  fileRanges.push({ startLine, endLine });
+  ranges.set(target, fileRanges);
+}
+
+/** Whether one or more read windows cover every line of the required region. */
+function hasReadCoverage(ctx: ToolContext, target: string, startLine: number, endLine: number): boolean {
+  const ranges = (ctx.readRanges?.get(target) || [])
+    .filter(range => range.endLine >= startLine && range.startLine <= endLine)
+    .sort((a, b) => a.startLine - b.startLine);
+  let coveredThrough = startLine - 1;
+  for (const range of ranges) {
+    if (range.startLine > coveredThrough + 1) { break; }
+    coveredThrough = Math.max(coveredThrough, range.endLine);
+    if (coveredThrough >= endLine) { return true; }
+  }
+  return false;
+}
+
+function lineAt(text: string, index: number): number {
+  return text.slice(0, Math.max(0, index)).split(/\r?\n/).length;
+}
+
+/**
+ * Semantic snippets can be stale, abbreviated, or formatted differently from
+ * disk. Before changing a file that came from RAG, force a live read around the
+ * exact edit location. This runs only for RAG files; normal edits are unchanged.
+ */
+function ragReadRequirement(
+  ctx: ToolContext,
+  target: string,
+  totalLines: number,
+  editStartLine: number,
+  editEndLine: number,
+): string | undefined {
+  if (!ctx.ragFiles?.has(target)) { return undefined; }
+  const startLine = Math.max(1, editStartLine - RAG_EDIT_CONTEXT_LINES);
+  const endLine = Math.min(totalLines, editEndLine + RAG_EDIT_CONTEXT_LINES);
+  if (hasReadCoverage(ctx, target, startLine, endLine)) { return undefined; }
+
+  const firstPageLines = Math.min(2000, endLine - startLine + 1);
+  const more = firstPageLines < endLine - startLine + 1
+    ? ` Then continue with offset=${startLine + firstPageLines} until line ${endLine}.`
+    : '';
+  return (
+    `Before editing RAG-retrieved code, read the current on-disk context first. ` +
+    `This change is at lines ${editStartLine}-${editEndLine}; read lines ${startLine}-${endLine} ` +
+    `(${RAG_EDIT_CONTEXT_LINES} lines above and below, expanded for the change) with ` +
+    `read_file(path=${JSON.stringify(target)}, offset=${startLine}, max_lines=${firstPageLines}).` +
+    `${more} Nothing changed.`
+  );
+}
 
 const readFile: ToolSpec = {
   name: 'read_file',
@@ -117,6 +175,7 @@ const readFile: ToolSpec = {
       footer = '\n…(the file is too large to read fully; this is as far as it goes.)';
     }
 
+    rememberReadRange(ctx, target, offset, lastLine);
     return `${header}\n${kept.join('\n')}${footer}`;
   },
 };
@@ -259,7 +318,11 @@ const editFile: ToolSpec = {
     let next: string;
     let note: string;
 
+    const totalLines = text.split(/\r?\n/).length;
+
     if (args.append !== undefined && args.append !== null) {
+      const requirement = ragReadRequirement(ctx, target, totalLines, totalLines, totalLines);
+      if (requirement) { return requirement; }
       next = text + args.append;
       note = `Appended ${String(args.append).length} character(s) to ${target}.`;
     } else if (args.old_text !== undefined && args.old_text !== null) {
@@ -278,6 +341,10 @@ const editFile: ToolSpec = {
         return `That text appears ${count} times in ${target}; make it more specific so I change exactly the right one.`;
       }
       const idx = text.indexOf(old);
+      const editStartLine = lineAt(text, idx);
+      const editEndLine = lineAt(text, idx + Math.max(0, old.length - 1));
+      const requirement = ragReadRequirement(ctx, target, totalLines, editStartLine, editEndLine);
+      if (requirement) { return requirement; }
       next = text.slice(0, idx) + (args.new_text ?? '') + text.slice(idx + old.length);
       note = `Replaced 1 occurrence in ${target}.`;
     } else {
