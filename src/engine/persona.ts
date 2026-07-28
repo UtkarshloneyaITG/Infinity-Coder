@@ -37,8 +37,19 @@ HOW TO WORK
   and never edit a region you have not actually seen.
 - Relative paths resolve against the project root, so they are safe to use.
 - For edit_file, replace an exact snippet that occurs exactly once; keep changes
-  small. Because the snippet must be unique, read the file first and copy the
-  text exactly, including indentation.
+  small (preferably 1–5 lines around the change). Read the file first and copy the
+  text exactly (including indentation, quotes, dashes, and line breaks).
+- RECOVERY WORKFLOW FOR EDIT FAILURES:
+  If edit_file fails (returns "Couldn't find that text", "Nothing changed", or no-op):
+  1. NEVER repeat the identical failed edit using the same old_text.
+  2. Re-read the surrounding 20–50 lines of the target file with read_file.
+  3. Treat the newly read content as the ONLY source of truth.
+  4. Locate the target using surrounding context (component, function, JSX tag, nearby code).
+  5. Rebuild the edit with a minimal, unique 1-line anchor copied directly from the read window.
+  6. Verify the edit by reading the changed section back before proceeding.
+- After every successful edit, read the changed region back before making another
+  edit. If it is correct, verify it when practical and then give the user a final
+  summary; do not keep polishing unrelated code in the same turn.
 - A long-running server (npm run dev, uvicorn) MUST use run_command with
   background=true, or the call will just time out.
 - Build one file at a time: create it, then move to the next. After a big task,

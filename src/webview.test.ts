@@ -358,7 +358,7 @@ async function main() {
     inline!.slice(inline!.indexOf('const TOOL_VERBS'), inline!.indexOf('};', inline!.indexOf('const TOOL_VERBS')) + 2) + '\n' +
     inline!.slice(inline!.indexOf('const TOOL_SUBJECT'), inline!.indexOf('};', inline!.indexOf('const TOOL_SUBJECT')) + 2) + '\n' +
     "const DEFAULT_SUBJECT = ['path','file','target_file','filepath','target'];\n" +
-    grab('function formatToolInfo(name, input, done) {') +
+    grab('function formatToolInfo(name, input, done, result) {') +
     '; return { formatToolInfo, TOOL_VERBS };'
   )();
 
@@ -392,6 +392,19 @@ async function main() {
   // Only a real path is offered as a clickable jump link.
   assert.strictEqual(labelApi.formatToolInfo('read_file', { path: 'a/b.ts' }, true).isClickable, true);
   assert.strictEqual(labelApi.formatToolInfo('web_search', { query: 'x' }, true).isClickable, false);
+
+  // Tool details & status formatting (read range, line changes, failure/no-op status)
+  const infoRead = labelApi.formatToolInfo('read_file', { path: 'a/b.ts', offset: 1, max_lines: 300 }, true, 'a/b.ts (lines 1-300 of 1240):');
+  assert.strictEqual(infoRead.detail, '· lines 1–300 of 1240');
+  assert.strictEqual(infoRead.status, 'done');
+
+  const infoEdit = labelApi.formatToolInfo('edit_file', { path: 'a/b.ts' }, true, 'Replaced 1 occurrence in a/b.ts (+5 −2 lines changed).');
+  assert.strictEqual(infoEdit.detail, '(+5 −2 lines changed)');
+  assert.strictEqual(infoEdit.status, 'done');
+
+  const infoNoOp = labelApi.formatToolInfo('edit_file', { path: 'a/b.ts' }, true, "Couldn't find that text in a/b.ts. Nothing changed.");
+  assert.strictEqual(infoNoOp.status, 'no-op');
+  assert.strictEqual(infoNoOp.verb, 'No change to');
 
   // ── an answered card must settle on the click itself ─────────────
   // Not on the extension's reply. Whatever goes wrong with that round-trip — a

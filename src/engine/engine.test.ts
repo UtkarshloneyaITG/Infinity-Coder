@@ -220,6 +220,12 @@ async function main() {
   out = await dispatch('edit_file', { path: 'edit.txt' }, ctx);
   assert.ok(out.includes('Tell me what to change'), 'an edit with no mode asks rather than no-ops silently');
 
+  // Normalized fallback matching (e.g., em-dash vs hyphen or HTML entity)
+  fs.writeFileSync(path.join(tmp, 'dash.txt'), 'Aether Studio &mdash; Award Winning Agency');
+  out = await dispatch('edit_file', { path: 'dash.txt', old_text: 'Aether Studio — Award Winning Agency', new_text: 'Your Brand — Cutting Edge Agency' }, ctx);
+  assert.ok(out.includes('Replaced 1'), out);
+  assert.strictEqual(fs.readFileSync(path.join(tmp, 'dash.txt'), 'utf8'), 'Your Brand — Cutting Edge Agency');
+
   // Semantic context helps locate code but can be stale or formatted differently.
   // A RAG-sourced file therefore needs a fresh read around the actual edit before
   // edit_file can write it. The guard applies only to this RAG-marked context.

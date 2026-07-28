@@ -50,6 +50,60 @@ function lineAt(text: string, index: number): number {
   return text.slice(0, Math.max(0, index)).split(/\r?\n/).length;
 }
 
+function lineChangeStats(before: string | null, after: string | null): { added: number; removed: number } {
+  const tally = (value: string | null) => {
+    const counts = new Map<string, number>();
+    if (value) {
+      for (const line of value.split(/\r?\n/)) {
+        counts.set(line, (counts.get(line) || 0) + 1);
+      }
+    }
+    return counts;
+  };
+  const oldLines = tally(before);
+  const newLines = tally(after);
+  let added = 0;
+  let removed = 0;
+  for (const [line, count] of newLines) { added += Math.max(0, count - (oldLines.get(line) || 0)); }
+  for (const [line, count] of oldLines) { removed += Math.max(0, count - (newLines.get(line) || 0)); }
+  return { added, removed };
+}
+
+function lineChangeLabel(before: string | null, after: string | null): string {
+  const { added, removed } = lineChangeStats(before, after);
+  return `+${added} −${removed} line${added + removed === 1 ? '' : 's'} changed`;
+}
+
+function rememberPendingEdit(ctx: ToolContext, target: string, startLine: number, endLine: number): void {
+  const pending = ctx.pendingEditVerifications || (ctx.pendingEditVerifications = new Map());
+  pending.set(target, { startLine, endLine });
+}
+
+function confirmPendingEdit(ctx: ToolContext, target: string): { startLine: number; endLine: number } | undefined {
+  const pending = ctx.pendingEditVerifications?.get(target);
+  if (!pending || !hasReadCoverage(ctx, target, pending.startLine, pending.endLine)) {
+    return undefined;
+  }
+  ctx.pendingEditVerifications!.delete(target);
+  return pending;
+}
+
+function pendingEditRequirement(ctx: ToolContext, target?: string): string | undefined {
+  if (target && !ctx.ragFiles?.has(target)) { return undefined; }
+  const pending = ctx.pendingEditVerifications;
+  if (!pending || pending.size === 0) { return undefined; }
+  const entry = target ? pending.get(target) : undefined;
+  if (target && !entry) { return undefined; }
+  const [pendingTarget, range] = target ? [target, entry!] : [...pending.entries()][0];
+  const lines = range.endLine - range.startLine + 1;
+  return (
+    `Before making another edit to ${pendingTarget}, verify the previous change in ${pendingTarget}. ` +
+    `Call read_file(path=${JSON.stringify(pendingTarget)}, offset=${range.startLine}, max_lines=${lines}) ` +
+    `to read changed lines ${range.startLine}-${range.endLine}, then either continue only if that read reveals ` +
+    `a concrete issue or give the user a final summary. Nothing changed.`
+  );
+}
+
 /**
  * Semantic snippets can be stale, abbreviated, or formatted differently from
  * disk. Before changing a file that came from RAG, force a live read around the
@@ -176,6 +230,10 @@ const readFile: ToolSpec = {
     }
 
     rememberReadRange(ctx, target, offset, lastLine);
+    const verified = confirmPendingEdit(ctx, target);
+    if (verified) {
+      footer += `\n(Verified the previous edit at lines ${verified.startLine}-${verified.endLine}.)`;
+    }
     return `${header}\n${kept.join('\n')}${footer}`;
   },
 };
@@ -265,11 +323,104 @@ const writeFile: ToolSpec = {
       return `Couldn't write ${target}: ${errText(e)}`;
     }
 
-    const lines = content ? content.split('\n').length : 0;
+    const lines = content ? content.split(/\r?\n/).length : 0;
     const bytes = Buffer.byteLength(content, 'utf8');
-    return `${existed ? 'Overwrote' : 'Wrote'} ${lines} line(s) (${bytes} bytes) to ${target}.`;
+    const changeLabel = lineChangeLabel(before, content);
+    rememberPendingEdit(ctx, target, 1, lines);
+    return `${existed ? 'Overwrote' : 'Wrote'} ${lines} line(s) (${bytes} bytes) to ${target} (${changeLabel}).`;
   },
 };
+
+function normalizeForEdit(s: string): string {
+  return s
+    .replace(/\r\n/g, '\n')
+    .replace(/[\u2014\u2013]|&mdash;|&ndash;/g, '-')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"');
+}
+
+function findNormalizedMatch(text: string, old: string): { idx: number; matchText: string } | null {
+  const normText = normalizeForEdit(text);
+  const normOld = normalizeForEdit(old);
+  if (!normOld || !normText.includes(normOld)) { return null; }
+
+  let count = 0;
+  let at = normText.indexOf(normOld);
+  while (at !== -1) {
+    count++;
+    at = normText.indexOf(normOld, at + normOld.length);
+  }
+  if (count !== 1) { return null; }
+
+  const rawLines = text.split(/\r?\n/);
+  const oldLines = old.split(/\r?\n/);
+  const normOldLines = oldLines.map(normalizeForEdit);
+
+  let matchStartLine = -1;
+  let matchesCount = 0;
+
+  for (let i = 0; i <= rawLines.length - normOldLines.length; i++) {
+    let matchesAll = true;
+    for (let j = 0; j < normOldLines.length; j++) {
+      if (!normalizeForEdit(rawLines[i + j]).includes(normOldLines[j])) {
+        matchesAll = false;
+        break;
+      }
+    }
+    if (matchesAll) {
+      matchesCount++;
+      matchStartLine = i;
+    }
+  }
+
+  if (matchesCount === 1 && matchStartLine !== -1) {
+    if (normOldLines.length === 1) {
+      const rawLine = rawLines[matchStartLine];
+      const lineNorm = normalizeForEdit(rawLine);
+      const startInNorm = lineNorm.indexOf(normOldLines[0]);
+      if (startInNorm !== -1) {
+        let rawCharIdx = 0;
+        let normCharIdx = 0;
+        let rawStart = 0;
+
+        while (rawCharIdx < rawLine.length && normCharIdx <= startInNorm) {
+          if (normCharIdx === startInNorm) { rawStart = rawCharIdx; }
+          const rest = rawLine.slice(rawCharIdx);
+          if (rest.startsWith('&mdash;') || rest.startsWith('&ndash;')) {
+            rawCharIdx += 7;
+            normCharIdx += 1;
+          } else {
+            rawCharIdx += 1;
+            normCharIdx += 1;
+          }
+        }
+        const targetNormEnd = startInNorm + normOldLines[0].length;
+        rawCharIdx = rawStart;
+        normCharIdx = startInNorm;
+        while (rawCharIdx < rawLine.length && normCharIdx < targetNormEnd) {
+          const rest = rawLine.slice(rawCharIdx);
+          if (rest.startsWith('&mdash;') || rest.startsWith('&ndash;')) {
+            rawCharIdx += 7;
+            normCharIdx += 1;
+          } else {
+            rawCharIdx += 1;
+            normCharIdx += 1;
+          }
+        }
+        const rawEnd = rawCharIdx;
+        const matchText = rawLine.slice(rawStart, rawEnd);
+        let charOffset = 0;
+        for (let l = 0; l < matchStartLine; l++) {
+          charOffset += rawLines[l].length + (text.includes('\r\n') ? 2 : 1);
+        }
+        charOffset += rawStart;
+        return { idx: charOffset, matchText };
+      }
+    }
+  }
+
+  return null;
+}
 
 const editFile: ToolSpec = {
   name: 'edit_file',
@@ -301,6 +452,9 @@ const editFile: ToolSpec = {
       return `That's a folder, not a file: ${target}.`;
     }
 
+    const pendingReq = pendingEditRequirement(ctx, target);
+    if (pendingReq) { return pendingReq; }
+
     let raw: Buffer;
     try {
       if (fs.statSync(target).size > MAX_EDIT_BYTES) {
@@ -320,11 +474,16 @@ const editFile: ToolSpec = {
 
     const totalLines = text.split(/\r?\n/).length;
 
+
+
     if (args.append !== undefined && args.append !== null) {
       const requirement = ragReadRequirement(ctx, target, totalLines, totalLines, totalLines);
       if (requirement) { return requirement; }
       next = text + args.append;
-      note = `Appended ${String(args.append).length} character(s) to ${target}.`;
+      const appendLines = String(args.append).split(/\r?\n/).length;
+      const changeLabel = lineChangeLabel(text, next);
+      rememberPendingEdit(ctx, target, totalLines, Math.max(totalLines, totalLines + appendLines - 1));
+      note = `Appended ${String(args.append).length} character(s) to ${target} (${changeLabel}).`;
     } else if (args.old_text !== undefined && args.old_text !== null) {
       const old = String(args.old_text);
       // Count occurrences without a regex, so no escaping of the model's text.
@@ -334,19 +493,37 @@ const editFile: ToolSpec = {
         count++;
         at = text.indexOf(old, at + old.length);
       }
+      let idx = text.indexOf(old);
+      let targetOldText = old;
+
       if (count === 0) {
-        return `Couldn't find that text in ${target}. Nothing changed.`;
+        const normMatch = findNormalizedMatch(text, old);
+        if (normMatch) {
+          count = 1;
+          idx = normMatch.idx;
+          targetOldText = normMatch.matchText;
+        } else {
+          return (
+            `Couldn't find that text in ${target}. Check if dashes (— vs -), quotes (' vs "), ` +
+            `HTML entities (&mdash;), or newlines differ. Call read_file around that line first, ` +
+            `and copy a smaller 1-line anchor string directly from the file content. Nothing changed.`
+          );
+        }
       }
       if (count > 1) {
         return `That text appears ${count} times in ${target}; make it more specific so I change exactly the right one.`;
       }
-      const idx = text.indexOf(old);
       const editStartLine = lineAt(text, idx);
-      const editEndLine = lineAt(text, idx + Math.max(0, old.length - 1));
+      const editEndLine = lineAt(text, idx + Math.max(0, targetOldText.length - 1));
       const requirement = ragReadRequirement(ctx, target, totalLines, editStartLine, editEndLine);
       if (requirement) { return requirement; }
-      next = text.slice(0, idx) + (args.new_text ?? '') + text.slice(idx + old.length);
-      note = `Replaced 1 occurrence in ${target}.`;
+      next = text.slice(0, idx) + (args.new_text ?? '') + text.slice(idx + targetOldText.length);
+      if (next === text) {
+        return `Target text produces no change in ${target}. Nothing changed.`;
+      }
+      const changeLabel = lineChangeLabel(text, next);
+      rememberPendingEdit(ctx, target, editStartLine, editEndLine);
+      note = `Replaced 1 occurrence in ${target} (${changeLabel}).`;
     } else {
       return 'Tell me what to change: give old_text (and new_text) to replace, or append to add text to the end.';
     }

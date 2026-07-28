@@ -2189,6 +2189,23 @@ ${built.text}`,
       border-left-color: var(--accent-strong);
     }
 
+    .tool-indicator.failed {
+      border-left-color: #f43f5e;
+      color: #f43f5e;
+    }
+
+    .tool-indicator.no-op {
+      border-left-color: #f59e0b;
+      color: var(--text-dim);
+    }
+
+    .tool-detail {
+      font-size: 0.72rem;
+      opacity: 0.8;
+      margin-left: 2px;
+      white-space: nowrap;
+    }
+
     .file-jump-link {
       color: var(--link-color);
       text-decoration: underline;
@@ -3835,6 +3852,8 @@ ${built.text}`,
       file: \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>\`,
       tool: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>\`,
       check: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-strong)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>\`,
+      cross: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>\`,
+      alert: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>\`,
       spinner: \`<svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-strong)" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>\`
     };
 
@@ -3889,7 +3908,7 @@ ${built.text}`,
     };
     const DEFAULT_SUBJECT = ['path', 'file', 'target_file', 'filepath', 'target'];
 
-    function formatToolInfo(name, input, done) {
+    function formatToolInfo(name, input, done, result) {
       const keys = TOOL_SUBJECT[name] || DEFAULT_SUBJECT;
       let raw = '';
       for (const key of keys) {
@@ -3909,9 +3928,58 @@ ${built.text}`,
         displayPath = asUrl ? asUrl[1] : raw.slice(0, 48);
       }
 
+      let status = done ? 'done' : 'running';
+      let detail = '';
+      let isError = false;
+      let isNoOp = false;
+
+      const resultStr = typeof result === 'string' ? result : (result ? JSON.stringify(result) : '');
+
+      if (done && resultStr) {
+        if (/Nothing changed|Nothing created|Nothing to delete/i.test(resultStr)) {
+          isNoOp = true;
+          status = 'no-op';
+        } else if (
+          /Couldn't|Refusing|Refused|Before editing RAG|Before making another edit|Error:|That path doesn't exist|appears \\d+ times|is past the end|is a folder/i.test(resultStr)
+        ) {
+          isError = true;
+          status = 'failed';
+        }
+      }
+
       const pair = TOOL_VERBS[name];
-      const verb = pair ? (done ? pair[1] : pair[0])
-        : (done ? 'Used' : 'Running') + ' ' + name.replace(/_/g, ' ');
+      let verb = pair ? (done ? (isError ? 'Failed ' + pair[0].toLowerCase() : (isNoOp ? 'No change to' : pair[1])) : pair[0])
+        : (done ? (isError ? 'Failed' : 'Used') : 'Running') + ' ' + name.replace(/_/g, ' ');
+
+      if (name === 'read_file') {
+        if (done && resultStr && !isError) {
+          const matchRange = resultStr.match(/\\(lines (\\d+)-(\\d+)(?: of (\\d+))?\\)/i);
+          const matchLines = resultStr.match(/\\((\\d+) lines?\\)/i);
+          if (matchRange) {
+            detail = '· lines ' + matchRange[1] + '–' + matchRange[2] + (matchRange[3] ? ' of ' + matchRange[3] : '');
+          } else if (matchLines) {
+            detail = '· lines 1–' + matchLines[1] + ' of ' + matchLines[1];
+          } else if (input && input.offset !== undefined) {
+            const start = Number(input.offset) || 1;
+            const linesInRes = (resultStr.split(/\\r?\\n/).length - 1) || Number(input.max_lines) || 200;
+            detail = '· lines ' + start + '–' + (start + linesInRes - 1);
+          }
+        } else if (!done && input) {
+          const start = Number(input.offset) || 1;
+          const max = Number(input.max_lines) || 200;
+          detail = '· lines ' + start + '–' + (start + max - 1);
+        }
+      } else if (name === 'edit_file' || name === 'write_file') {
+        if (done && resultStr && !isError && !isNoOp) {
+          const matchDiff = resultStr.match(/(\\+?\\d+\\s*[−-]\\d+\\s*lines?\\s*changed)/i);
+          if (matchDiff) {
+            detail = '(' + matchDiff[1] + ')';
+          } else if (name === 'write_file' && input && input.content !== undefined) {
+            const count = input.content ? input.content.split(/\\r?\\n/).length : 0;
+            detail = '(+' + count + ' −0 lines changed)';
+          }
+        }
+      }
 
       // Only create clickable jump links for actual files (not folder operations)
       const isFileTool = ["read_file", "edit_file", "write_file", "create_item", "delete_item"].includes(name) || (filePath && filePath.includes('.'));
@@ -3923,14 +3991,18 @@ ${built.text}`,
             verb,
             fileLabel: displayPath,
             fullPath: filePath,
-            isClickable: true
+            isClickable: true,
+            detail,
+            status
           };
         } else {
           return {
-            verb: \`\${verb} \${displayPath}\`,
+            verb: verb + ' ' + displayPath,
             fileLabel: null,
             fullPath: null,
-            isClickable: false
+            isClickable: false,
+            detail,
+            status
           };
         }
       }
@@ -3939,7 +4011,9 @@ ${built.text}`,
         verb,
         fileLabel: null,
         fullPath: null,
-        isClickable: false
+        isClickable: false,
+        detail,
+        status
       };
     }
 
@@ -4580,13 +4654,20 @@ ${built.text}`,
               div.appendChild(renderThinking(m.id + ':' + blockIndex, block.text));
             } else if (block.type === 'tool') {
               const toolItem = document.createElement('div');
-              toolItem.className = 'tool-indicator ' + (block.done ? 'done' : 'running');
-              const iconHtml = block.done ? SVG_ICONS.check : SVG_ICONS.spinner;
-              const info = formatToolInfo(block.name, block.input, block.done);
+              const info = formatToolInfo(block.name, block.input, block.done, block.result);
+              const statusClass = info.status || (block.done ? 'done' : 'running');
+              const iconHtml = !block.done ? SVG_ICONS.spinner
+                : (statusClass === 'failed' ? SVG_ICONS.cross
+                : (statusClass === 'no-op' ? SVG_ICONS.alert : SVG_ICONS.check));
+
+              toolItem.className = 'tool-indicator ' + statusClass;
 
               let labelHtml = escapeHtml(info.verb) + (block.done ? '' : '...');
               if (info.fileLabel && info.isClickable) {
-                labelHtml += \` <span class="file-jump-link" data-path="\${escapeHtml(info.fullPath)}">\${escapeHtml(info.fileLabel)}</span>\`;
+                labelHtml += ' <span class="file-jump-link" data-path="' + escapeHtml(info.fullPath) + '">' + escapeHtml(info.fileLabel) + '</span>';
+              }
+              if (info.detail) {
+                labelHtml += ' <span class="tool-detail">' + escapeHtml(info.detail) + '</span>';
               }
 
               toolItem.innerHTML = iconHtml + '<span>' + labelHtml + '</span>';
@@ -4611,38 +4692,11 @@ ${built.text}`,
 
               bodyDiv.querySelectorAll('pre code').forEach(codeBlock => {
                 const pre = codeBlock.parentElement;
-                const codeText = codeBlock.textContent;
                 const lang = codeBlock.className.replace('language-', '') || 'code';
 
                 const header = document.createElement('div');
                 header.className = 'code-header';
-                header.innerHTML = \`
-                  <span>\${escapeHtml(lang)}</span>
-                  <div class="code-actions">
-                    <button class="btn-code copy-btn">Copy</button>
-                    <button class="btn-code insert-btn">Insert</button>
-                    <button class="btn-code replace-btn">Replace</button>
-                  </div>
-                \`;
-
-                header.querySelector('.copy-btn').addEventListener('click', (e) => {
-                  const btn = e.target;
-                  vscode.postMessage({ type: 'copyText', text: codeText });
-                  btn.textContent = 'Copied!';
-                  setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-                });
-                header.querySelector('.insert-btn').addEventListener('click', (e) => {
-                  const btn = e.target;
-                  vscode.postMessage({ type: 'insertCode', code: codeText });
-                  btn.textContent = 'Inserted!';
-                  setTimeout(() => { btn.textContent = 'Insert'; }, 1500);
-                });
-                header.querySelector('.replace-btn').addEventListener('click', (e) => {
-                  const btn = e.target;
-                  vscode.postMessage({ type: 'replaceCode', code: codeText });
-                  btn.textContent = 'Replaced!';
-                  setTimeout(() => { btn.textContent = 'Replace'; }, 1500);
-                });
+                header.innerHTML = \`<span>\${escapeHtml(lang)}</span>\`;
 
                 pre.insertBefore(header, codeBlock);
               });
@@ -4674,13 +4728,20 @@ ${built.text}`,
 
             toolGroups.forEach(tg => {
               const toolItem = document.createElement('div');
-              toolItem.className = 'tool-indicator ' + (tg.done ? 'done' : 'running');
-              const iconHtml = tg.done ? SVG_ICONS.check : SVG_ICONS.spinner;
-              const info = formatToolInfo(tg.name, tg.input, tg.done);
+              const info = formatToolInfo(tg.name, tg.input, tg.done, tg.result);
+              const statusClass = info.status || (tg.done ? 'done' : 'running');
+              const iconHtml = !tg.done ? SVG_ICONS.spinner
+                : (statusClass === 'failed' ? SVG_ICONS.cross
+                : (statusClass === 'no-op' ? SVG_ICONS.alert : SVG_ICONS.check));
+
+              toolItem.className = 'tool-indicator ' + statusClass;
 
               let labelHtml = escapeHtml(info.verb) + (tg.done ? '' : '...');
               if (info.fileLabel && info.isClickable) {
-                labelHtml += \` <span class="file-jump-link" data-path="\${escapeHtml(info.fullPath)}">\${escapeHtml(info.fileLabel)}</span>\`;
+                labelHtml += ' <span class="file-jump-link" data-path="' + escapeHtml(info.fullPath) + '">' + escapeHtml(info.fileLabel) + '</span>';
+              }
+              if (info.detail) {
+                labelHtml += ' <span class="tool-detail">' + escapeHtml(info.detail) + '</span>';
               }
 
               toolItem.innerHTML = iconHtml + '<span>' + labelHtml + '</span>';
@@ -4706,38 +4767,11 @@ ${built.text}`,
 
             bodyDiv.querySelectorAll('pre code').forEach(codeBlock => {
               const pre = codeBlock.parentElement;
-              const codeText = codeBlock.textContent;
               const lang = codeBlock.className.replace('language-', '') || 'code';
 
               const header = document.createElement('div');
               header.className = 'code-header';
-              header.innerHTML = \`
-                <span>\${escapeHtml(lang)}</span>
-                <div class="code-actions">
-                  <button class="btn-code copy-btn">Copy</button>
-                  <button class="btn-code insert-btn">Insert</button>
-                  <button class="btn-code replace-btn">Replace</button>
-                </div>
-              \`;
-
-              header.querySelector('.copy-btn').addEventListener('click', (e) => {
-                const btn = e.target;
-                vscode.postMessage({ type: 'copyText', text: codeText });
-                btn.textContent = 'Copied!';
-                setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-              });
-              header.querySelector('.insert-btn').addEventListener('click', (e) => {
-                const btn = e.target;
-                vscode.postMessage({ type: 'insertCode', code: codeText });
-                btn.textContent = 'Inserted!';
-                setTimeout(() => { btn.textContent = 'Insert'; }, 1500);
-              });
-              header.querySelector('.replace-btn').addEventListener('click', (e) => {
-                const btn = e.target;
-                vscode.postMessage({ type: 'replaceCode', code: codeText });
-                btn.textContent = 'Replaced!';
-                setTimeout(() => { btn.textContent = 'Replace'; }, 1500);
-              });
+              header.innerHTML = \`<span>\${escapeHtml(lang)}</span>\`;
 
               pre.insertBefore(header, codeBlock);
             });

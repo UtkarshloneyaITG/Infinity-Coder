@@ -37,6 +37,8 @@ export interface ToolContext {
   ragFiles?: Set<string>;
   /** Successful read_file windows in this turn, keyed by absolute file path. */
   readRanges?: Map<string, Array<{ startLine: number; endLine: number }>>;
+  /** A successful edit must be read back before another edit can be attempted. */
+  pendingEditVerifications?: Map<string, { startLine: number; endLine: number }>;
 }
 
 export interface ApprovalRequest {

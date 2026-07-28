@@ -239,6 +239,7 @@ export class Engine {
       approve: opts.approve,
       ragFiles: opts.ragFiles?.length ? new Set(opts.ragFiles) : undefined,
       readRanges: new Map(),
+      pendingEditVerifications: new Map(),
     };
     const skills = opts.skills || [];
     const system = opts.systemOverride ?? systemPrompt(opts.workspaceRoot, skills, opts.planMode);
