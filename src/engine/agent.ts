@@ -303,6 +303,19 @@ export class Engine {
         promptTokens = result.usage.prompt_tokens || promptTokens;
       }
 
+      if (result.finishReason === 'length') {
+        opts.history.push({ role: 'assistant', content: result.content });
+        opts.history.push({
+          role: 'user',
+          content: 'Your previous response hit the output token limit mid-way. Please continue directly from where you stopped without repeating yourself.',
+        });
+        opts.onEvent({
+          type: 'notice',
+          text: 'Response hit max tokens — automatically continuing response...',
+        });
+        continue;
+      }
+
       if (result.finishReason === 'tool_calls' && result.toolCalls.length > 0) {
         // A model that asks for the identical thing over and over is stuck, and
         // will stay stuck for every remaining round. Cut it off early.
@@ -402,41 +415,51 @@ export class Engine {
     opts: ChatOptions,
     suppressTools = false
   ): Promise<{ result: RoundResult; used: Candidate }> {
-    let lastError: ProviderError | undefined;
+    let lastError: Error | undefined;
 
-    for (let i = 0; i < candidates.length; i++) {
-      const candidate = candidates[i];
+    for (const candidate of candidates) {
+      if (opts.signal.aborted) {
+        throw new Error('Aborted');
+      }
       try {
-        const result = await this.runRound(candidate, messages, settings, opts, suppressTools);
+        const result = await this.streamOne(candidate, messages, settings, opts, suppressTools);
         return { result, used: candidate };
-      } catch (e) {
+      } catch (err: any) {
+        lastError = err;
         if (opts.signal.aborted) {
-          throw e; // the user pressed stop — not a failover situation
+          throw err;
         }
-        if (!(e instanceof ProviderError) || e.emitted || !isRetriable(e.status)) {
-          throw e instanceof ProviderError ? new Error(friendlyMessage(e.status, e.message)) : e;
+
+        // Mid-output failure: the user already saw part of the response, so a
+        // retry would append a second attempt after the broken one. Fail fast.
+        if (err instanceof ProviderError && err.emitted) {
+          throw err;
         }
-        lastError = e;
-        const next = candidates[i + 1];
+
+        const status = err instanceof ProviderError ? err.status : undefined;
+        if (!isRetriable(status)) {
+          // A 400 parameter mismatch will fail on every candidate — don't waste
+          // time walking the rest of the list.
+          throw err;
+        }
+
+        const next = candidates[candidates.indexOf(candidate) + 1];
         if (next) {
-          opts.onEvent({ type: 'notice', text: failoverNotice(candidate, next, e.status) });
+          opts.onEvent({ type: 'notice', text: failoverNotice(candidate, next, status) });
         }
       }
     }
 
-    throw new Error(
-      lastError
-        ? friendlyMessage(lastError.status, lastError.message)
-        : 'Every configured provider failed. Check your keys in Settings.'
-    );
+    const status = lastError instanceof ProviderError ? lastError.status : undefined;
+    throw new Error(friendlyMessage(status, lastError?.message || 'unknown error'));
   }
 
-  private async runRound(
+  private async streamOne(
     candidate: Candidate,
     messages: Msg[],
     settings: ReturnType<SettingsStore['get']>,
     opts: ChatOptions,
-    suppressTools = false
+    suppressTools: boolean
   ): Promise<RoundResult> {
     const body: any = {
       model: candidate.model,
@@ -466,6 +489,10 @@ export class Engine {
     }
 
     let res: Response;
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), 120_000);
+    const combinedSignal = opts.signal ? AbortSignal.any([opts.signal, timeoutController.signal]) : timeoutController.signal;
+
     try {
       res = await fetch(`${candidate.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -474,13 +501,19 @@ export class Engine {
           Authorization: `Bearer ${candidate.apiKey}`,
         },
         body: JSON.stringify(body),
-        signal: opts.signal,
+        signal: combinedSignal,
       });
     } catch (e: any) {
-      if (opts.signal.aborted) {
+      clearTimeout(timeoutId);
+      if (opts.signal?.aborted) {
         throw e;
       }
+      if (timeoutController.signal.aborted) {
+        throw new ProviderError('Request timed out after 120 seconds.', 408, false);
+      }
       throw new ProviderError(e?.message || 'network error', undefined, false);
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     if (!res.ok) {
@@ -651,21 +684,15 @@ export function trimHistory(history: Msg[], maxContextTokens = 128_000): void {
       break;
     }
   }
-  if (keepFrom === 0) {
-    return;
-  }
 
-  // Advance to the next plain user turn so we never cut mid tool-call sequence.
-  while (keepFrom < history.length) {
-    const msg = history[keepFrom];
-    if (msg.role === 'user' && typeof msg.content === 'string') {
-      break;
+  // Never drop the system prompt if one was placed in position 0.
+  if (keepFrom > 0) {
+    // Cut back to the nearest plain user turn.
+    while (keepFrom < history.length && history[keepFrom].role !== 'user') {
+      keepFrom++;
     }
-    keepFrom++;
+    if (keepFrom > 0 && keepFrom < history.length) {
+      history.splice(0, keepFrom);
+    }
   }
-  // Never empty the history entirely — one oversized turn is better than none.
-  if (keepFrom >= history.length) {
-    return;
-  }
-  history.splice(0, keepFrom);
 }
