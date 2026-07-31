@@ -55,6 +55,18 @@ function callSignature(calls: Array<{ name: string; args: string }>): string {
 }
 
 /**
+ * Normalise finish_reason across providers.
+ * OpenAI/Groq return "length", Anthropic returns "max_tokens", Gemini returns "MAX_TOKENS".
+ */
+function isLengthFinishReason(reason: string | null): boolean {
+  if (!reason) {
+    return false;
+  }
+  const r = reason.toLowerCase();
+  return r === 'length' || r === 'max_tokens' || r === 'max_token';
+}
+
+/**
  * Sanitize or generate a tool call ID that satisfies strict provider regexes
  * (e.g. Anthropic / Claude endpoints requiring a-z, A-Z, 0-9 of length 9).
  */
@@ -245,7 +257,7 @@ export class RequestPipeline implements IRequestPipeline, ILLMService {
       finalFinishReason = result.finishReason;
 
       // ── Auto-continuation ────────────────────────────────────────────────
-      if (result.finishReason === 'length') {
+      if (isLengthFinishReason(result.finishReason)) {
         if (continuationRounds >= maxContinuations) {
           opts.onEvent({ type: 'notice', text: 'Response truncated: max continuations reached.' });
           totalContent += result.content;
@@ -467,9 +479,10 @@ export class RequestPipeline implements IRequestPipeline, ILLMService {
         }
         const delta = choice.delta || {};
 
-        if (delta.reasoning_content) {
+        const reasoningText = delta.reasoning_content || delta.reasoning || delta.thinking;
+        if (reasoningText) {
           emitted = true;
-          onEvent({ type: 'reasoning', text: delta.reasoning_content });
+          onEvent({ type: 'reasoning', text: reasoningText });
         }
         if (delta.content) {
           emitted = true;
