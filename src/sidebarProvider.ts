@@ -2927,7 +2927,7 @@ ${built.text}`,
     }
 
     /* Token usage footer & Cycle Graph Context Indicator */
-    .context-header-badge {
+    .context-header-badge, .context-footer-badge {
       display: flex;
       align-items: center;
       gap: 5px;
@@ -2938,6 +2938,8 @@ ${built.text}`,
       font-size: 0.68rem;
       color: var(--text-dim);
       cursor: default;
+      flex-shrink: 0;
+      height: 24px;
     }
 
     .context-circle-pct {
@@ -3881,6 +3883,17 @@ ${built.text}`,
           <span id="attachChips"></span>
         </div>
         <div class="input-card-right">
+          <div class="context-footer-badge" id="contextFooterBadge" title="Live Context Window Reach (Circle Graph)">
+            <svg class="context-circle-svg" width="18" height="18" viewBox="0 0 36 36">
+              <circle cx="18" cy="18" r="14" fill="none" stroke="var(--border-bright)" stroke-width="3.5" opacity="0.3"></circle>
+              <circle id="contextFooterCircleRing" cx="18" cy="18" r="14" fill="none"
+                      stroke="#10b981" stroke-width="3.5"
+                      stroke-dasharray="88" stroke-dashoffset="88"
+                      stroke-linecap="round" transform="rotate(-90 18 18)"
+                      style="transition: stroke-dashoffset 0.4s ease, stroke 0.4s ease;"></circle>
+            </svg>
+            <span id="contextFooterCirclePct" class="context-circle-pct">0%</span>
+          </div>
           <button class="plan-toggle" id="planToggle" title="Plan mode — investigate and propose a plan, change nothing">
             <span class="plan-toggle-dot"></span>Plan
           </button>
@@ -5171,19 +5184,30 @@ ${built.text}`,
     }
 
     function updateHeaderContextCircle(pct) {
-      const ring = document.getElementById('contextCircleRing');
-      const label = document.getElementById('contextCirclePct');
-      if (!ring || !label) return;
-
       const validPct = Math.min(100, Math.max(0, pct || 0));
       const circumference = 88;
       const dashOffset = circumference - (circumference * validPct / 100);
-
       const color = validPct >= 85 ? '#f43f5e' : (validPct >= 70 ? '#f59e0b' : '#10b981');
-      ring.style.strokeDashoffset = dashOffset;
-      ring.style.stroke = color;
-      label.textContent = validPct + '%';
-      label.style.color = color;
+
+      // Header circle
+      const ring = document.getElementById('contextCircleRing');
+      const label = document.getElementById('contextCirclePct');
+      if (ring && label) {
+        ring.style.strokeDashoffset = dashOffset;
+        ring.style.stroke = color;
+        label.textContent = validPct + '%';
+        label.style.color = color;
+      }
+
+      // Input footer permanent circle
+      const footerRing = document.getElementById('contextFooterCircleRing');
+      const footerLabel = document.getElementById('contextFooterCirclePct');
+      if (footerRing && footerLabel) {
+        footerRing.style.strokeDashoffset = dashOffset;
+        footerRing.style.stroke = color;
+        footerLabel.textContent = validPct + '%';
+        footerLabel.style.color = color;
+      }
     }
 
     function paintStreamTime() {
