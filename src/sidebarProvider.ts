@@ -2926,34 +2926,66 @@ ${built.text}`,
       line-height: 1.45;
     }
 
-    /* Token usage footer */
-    .usage-bar {
+    /* Token usage footer & Cycle Graph Context Indicator */
+    .context-header-badge {
       display: flex;
       align-items: center;
-      gap: 6px;
-      margin-top: 8px;
-      font-size: 0.64rem;
+      gap: 5px;
+      padding: 2px 7px;
+      border-radius: 12px;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      font-size: 0.68rem;
       color: var(--text-dim);
       cursor: default;
     }
 
-    .usage-meter {
-      width: 46px;
-      height: 3px;
-      border-radius: 2px;
-      background: var(--border);
-      overflow: hidden;
+    .context-circle-pct {
+      font-weight: 600;
+      font-size: 0.68rem;
+      color: #10b981;
+      font-family: var(--vscode-editor-font-family, monospace);
+    }
+
+    .usage-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      cursor: default;
+    }
+
+    .usage-circle-graph {
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
-    .usage-meter > span {
-      display: block;
-      height: 100%;
-      background: var(--accent);
+    .usage-text-info {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
     }
 
-    .usage-bar.hot { color: var(--danger); }
-    .usage-bar.hot .usage-meter > span { background: var(--danger); }
+    .usage-tokens-count {
+      font-weight: 600;
+      color: var(--text);
+      font-size: 0.7rem;
+    }
+
+    .usage-context-details {
+      font-size: 0.64rem;
+      color: var(--text-dim);
+    }
+
+    .usage-bar.hot { border-color: rgba(244, 63, 94, 0.4); background: rgba(244, 63, 94, 0.08); }
 
     /* ── Settings Modal ─────────────────────────────────────────────── */
     /* Sized for the VS Code sidebar (~300px), not a desktop dialog:
@@ -3382,6 +3414,17 @@ ${built.text}`,
       <span class="session-title" id="sessionTitle">New Chat</span>
     </div>
     <div class="header-actions">
+      <div class="context-header-badge" id="contextHeaderBadge" title="Context Window Reach (Circle Graph)">
+        <svg class="context-circle-svg" width="20" height="20" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="14" fill="none" stroke="var(--border-bright)" stroke-width="3.5" opacity="0.3"></circle>
+          <circle id="contextCircleRing" cx="18" cy="18" r="14" fill="none"
+                  stroke="#10b981" stroke-width="3.5"
+                  stroke-dasharray="88" stroke-dashoffset="88"
+                  stroke-linecap="round" transform="rotate(-90 18 18)"
+                  style="transition: stroke-dashoffset 0.4s ease, stroke 0.4s ease;"></circle>
+        </svg>
+        <span id="contextCirclePct" class="context-circle-pct">0%</span>
+      </div>
       <button class="btn-icon" id="historyBtn" title="Saved Chat Sessions"></button>
       <button class="btn-icon" id="newSessionBtn" title="New Chat Session"></button>
       <button class="btn-icon" id="deleteSessionBtn" title="Delete Current Chat"></button>
@@ -5127,6 +5170,22 @@ ${built.text}`,
       return 'Thinking';
     }
 
+    function updateHeaderContextCircle(pct) {
+      const ring = document.getElementById('contextCircleRing');
+      const label = document.getElementById('contextCirclePct');
+      if (!ring || !label) return;
+
+      const validPct = Math.min(100, Math.max(0, pct || 0));
+      const circumference = 88;
+      const dashOffset = circumference - (circumference * validPct / 100);
+
+      const color = validPct >= 85 ? '#f43f5e' : (validPct >= 70 ? '#f59e0b' : '#10b981');
+      ring.style.strokeDashoffset = dashOffset;
+      ring.style.stroke = color;
+      label.textContent = validPct + '%';
+      label.style.color = color;
+    }
+
     function paintStreamTime() {
       if (streamStartedAt === null) {
         streamStatusTime.textContent = '';
@@ -5164,28 +5223,40 @@ ${built.text}`,
       const used = usage.promptTokens + usage.completionTokens;
       const limit = usage.contextLimit || 0;
       const pct = limit > 0 ? Math.min(100, Math.round((usage.promptTokens / limit) * 100)) : 0;
+      updateHeaderContextCircle(pct);
+
+      const ringColor = pct >= 85 ? '#f43f5e' : (pct >= 70 ? '#f59e0b' : '#10b981');
+      const circumference = 88;
+      const dashOffset = circumference - (circumference * pct / 100);
 
       const wrap = document.createElement('div');
-      wrap.className = 'usage-bar' + (pct >= 80 ? ' hot' : '');
+      wrap.className = 'usage-bar' + (pct >= 85 ? ' hot' : '');
       wrap.title =
-        (usage.estimated ? 'Estimated — this provider did not report usage.\\n' : '') +
         'Prompt: ' + usage.promptTokens.toLocaleString() + ' tokens\\n' +
         'Reply: ' + usage.completionTokens.toLocaleString() + ' tokens\\n' +
         'Context budget: ' + limit.toLocaleString() + ' (set in Settings > Models)';
 
-      const meter = document.createElement('span');
-      meter.className = 'usage-meter';
-      const fill = document.createElement('span');
-      fill.style.width = pct + '%';
-      meter.appendChild(fill);
+      const circleContainer = document.createElement('div');
+      circleContainer.className = 'usage-circle-graph';
+      circleContainer.innerHTML =
+        '<svg width="28" height="28" viewBox="0 0 36 36">' +
+        '<circle cx="18" cy="18" r="14" fill="none" stroke="var(--border-bright)" stroke-width="3" opacity="0.3"></circle>' +
+        '<circle cx="18" cy="18" r="14" fill="none" stroke="' + ringColor + '" stroke-width="3.5" ' +
+        'stroke-dasharray="88" stroke-dashoffset="' + dashOffset + '" ' +
+        'stroke-linecap="round" transform="rotate(-90 18 18)" ' +
+        'style="transition: stroke-dashoffset 0.4s ease, stroke 0.4s ease;"></circle>' +
+        '<text x="18" y="21.5" text-anchor="middle" fill="var(--text)" font-size="8.5" font-weight="600">' + pct + '%</text>' +
+        '</svg>';
 
-      const label = document.createElement('span');
+      const details = document.createElement('div');
+      details.className = 'usage-text-info';
       const prefix = usage.estimated ? '≈' : '';
-      label.textContent =
-        prefix + used.toLocaleString() + ' tokens' + (limit > 0 ? ' · context ' + pct + '%' : '');
+      details.innerHTML =
+        '<div class="usage-tokens-count">' + prefix + used.toLocaleString() + ' tokens</div>' +
+        '<div class="usage-context-details">' + (limit > 0 ? 'Context reach: ' + pct + '% (' + limit.toLocaleString() + ' max)' : '') + '</div>';
 
-      wrap.appendChild(meter);
-      wrap.appendChild(label);
+      wrap.appendChild(circleContainer);
+      wrap.appendChild(details);
       return wrap;
     }
 
