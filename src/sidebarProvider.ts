@@ -1859,6 +1859,41 @@ ${built.text}`,
       justify-content: space-between;
       align-items: center;
       border-bottom: 1px solid var(--border);
+      gap: 6px;
+    }
+
+    .history-item-content {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .history-item-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .history-del-btn {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      opacity: 0.7;
+      flex-shrink: 0;
+    }
+
+    .history-del-btn:hover {
+      color: #f43f5e;
+      opacity: 1;
+      background: rgba(244, 63, 94, 0.15);
     }
 
     .history-item:hover {
@@ -3349,6 +3384,7 @@ ${built.text}`,
     <div class="header-actions">
       <button class="btn-icon" id="historyBtn" title="Saved Chat Sessions"></button>
       <button class="btn-icon" id="newSessionBtn" title="New Chat Session"></button>
+      <button class="btn-icon" id="deleteSessionBtn" title="Delete Current Chat"></button>
       <button class="btn-icon" id="settingsBtn" title="Settings"></button>
     </div>
   </div>
@@ -3854,11 +3890,14 @@ ${built.text}`,
       check: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-strong)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>\`,
       cross: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>\`,
       alert: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>\`,
-      spinner: \`<svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-strong)" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>\`
+      spinner: \`<svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-strong)" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>\`,
+      trash: \`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>\`
     };
 
     newSessionBtn.innerHTML = SVG_ICONS.plus;
     historyBtn.innerHTML = SVG_ICONS.history;
+    const deleteSessionBtn = document.getElementById('deleteSessionBtn');
+    if (deleteSessionBtn) { deleteSessionBtn.innerHTML = SVG_ICONS.trash; }
     settingsBtn.innerHTML = SVG_ICONS.settings;
     sendBtn.innerHTML = SVG_ICONS.arrowUp;
 
@@ -4165,6 +4204,11 @@ ${built.text}`,
     newSessionBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'newSession' });
     });
+    if (deleteSessionBtn) {
+      deleteSessionBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'clearChat' });
+      });
+    }
 
     settingsBtn.addEventListener('click', () => {
       settingsAction('load');

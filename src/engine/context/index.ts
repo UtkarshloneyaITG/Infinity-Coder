@@ -27,6 +27,7 @@ export { ContextCompactor } from './ContextCompactor';
 export { ConversationSummarizer } from './ConversationSummarizer';
 export { PromptBuilder } from './PromptBuilder';
 export { ContextManager, createContextManager } from './ContextManager';
+export { SemanticContextSource } from './SemanticContextSource';
 
 // ── Functions ─────────────────────────────────────────────────────────────────
 export { computeBudget } from './ContextBudget';
