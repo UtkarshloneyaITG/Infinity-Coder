@@ -74,6 +74,8 @@ export type ChatStreamEvent =
   | { type: 'tool_result'; name: string; result: string }
   | { type: 'notice'; text: string }
   | { type: 'usage'; usage: UsageInfo }
+  | { type: 'context_metrics'; metrics: ContextMetrics }
+  | { type: 'compaction'; saved: number; summarized: number; compressed: number }
   | { type: 'done'; content: string }
   | { type: 'error'; message: string };
 
@@ -103,4 +105,43 @@ export interface EngineStatus {
   model: string;
   engineReady: boolean;
   responseLanguage: string;
+}
+
+/**
+ * Live context metrics emitted as a `context_metrics` ChatStreamEvent every
+ * agent round. The webview uses this to render an accurate, real-time context bar.
+ */
+export interface ContextMetrics {
+  /** The active model's actual context window in tokens. */
+  contextWindow: number;
+  /** Tokens reserved for the model's reply. */
+  reservedOutput: number;
+  /** contextWindow - reservedOutput */
+  usableInput: number;
+  /** Estimated total tokens sent this round. */
+  currentUsage: number;
+  /** usableInput - currentUsage (can be negative if context is over-full). */
+  remaining: number;
+  /** 0–100. currentUsage / usableInput × 100. */
+  utilizationPct: number;
+  /** Tokens in tool result messages. */
+  toolTokens: number;
+  /** Tokens contributed by context sources (semantic, workspace, etc.). */
+  semanticTokens: number;
+  /** Tokens in the system prompt. */
+  systemTokens: number;
+  /** Tokens in all history messages (excluding sources). */
+  historyTokens: number;
+  /** Active compaction tier for this round. */
+  compactionTier: 'none' | 'tool' | 'summarize' | 'aggressive' | 'warn';
+  /** Whether compaction actually ran this round. */
+  compactionOccurred: boolean;
+  /** Tokens removed by compacting large tool outputs. */
+  compressionSaved: number;
+  /** Tokens replaced by summaries. */
+  summarizedTokens: number;
+  /** Tokens saved by aggressive truncation. */
+  aggressiveSaved: number;
+  /** Number of active InternalSummaryMsg objects in this session. */
+  activeSummaries: number;
 }

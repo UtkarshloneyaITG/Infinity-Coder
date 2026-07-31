@@ -2,7 +2,7 @@
   "name": "infinity-coder",
   "displayName": "Infinity Coder",
   "description": "Self-contained AI coding agent for VS Code. Bring your own OpenAI-compatible API key — no backend server, no telemetry, no dependencies.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "infinity-coder",
   "icon": "assets/icon.png",
   "galleryBanner": {
@@ -159,7 +159,7 @@
     "watch": "tsc -watch -p ./",
     "package": "npx --yes @vscode/vsce package",
     "pretest": "npm run compile",
-    "test": "node out/settings.test.js && node out/semantic/semantic.test.js && node out/engine/engine.test.js && node out/engine/skills.test.js && node out/webview.test.js && node out/brains/orchestration.test.js"
+    "test": "node out/settings.test.js && node out/semantic/semantic.test.js && node out/engine/context/context.test.js && node out/engine/engine.test.js && node out/engine/skills.test.js && node out/webview.test.js && node out/brains/orchestration.test.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",

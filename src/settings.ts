@@ -32,6 +32,8 @@ export interface InfinityCoderSettings {
   providers: Provider[];
   activeModel: string;
   boostModel: string;
+  /** Adaptive context manager settings. */
+  context: ContextSettings;
   /**
    * Model ids the user added by hand. Always offered in the picker regardless of
    * which providers have keys: they were typed deliberately, and may be an id
@@ -101,6 +103,34 @@ export interface SemanticSettings {
   contextTokens: number;
 }
 
+/**
+ * Adaptive context management settings.
+ *
+ * The Context Manager reads these on every prepare() call, so changes take
+ * effect on the very next message without restarting the extension.
+ */
+export interface ContextSettings {
+  /** Enable automatic context compaction. Default: true. */
+  autoCompact: boolean;
+  /**
+   * Utilization fraction (0.0–1.0) at which compaction starts.
+   * e.g. 0.70 means "start compacting when 70% of the usable input window is full".
+   */
+  compactThreshold: number;
+  /** Tokens reserved for the model's reply. Must be >= model's minimumReservedOutput. */
+  reservedOutputTokens: number;
+  /** When true, tier='aggressive' is used above 95% utilization. */
+  aggressiveCompression: boolean;
+  /**
+   * When true (and autoCompact is true), the ConversationSummarizer will call
+   * the LLM to produce structured summaries for old conversation segments.
+   * When false, only tool-output compaction runs (no extra API calls).
+   */
+  summaryEnabled: boolean;
+  /** Number of most-recent turn pairs to keep verbatim (not summarized). */
+  summaryDepth: number;
+}
+
 /** Tool group -> tool names. Used to build the `tools` param for a turn. */
 export const TOOL_GROUPS: Record<string, string[]> = {
   files: ['read_file', 'write_file', 'edit_file', 'create_item', 'delete_item', 'list_folder'],
@@ -153,6 +183,14 @@ const DEFAULTS: InfinityCoderSettings = {
   // Default to asking: the first time this agent edits a real repo should not be
   // a surprise. Users who want unattended runs can switch it off in one click.
   approvalMode: 'ask',
+  context: {
+    autoCompact: true,
+    compactThreshold: 0.70,
+    reservedOutputTokens: 4_096,
+    aggressiveCompression: true,
+    summaryEnabled: true,
+    summaryDepth: 5,
+  },
   semantic: {
     enabled: false,
     providerId: '',
@@ -191,6 +229,7 @@ export class SettingsStore {
       // Same reason as toolGroups: a settings blob written before a field
       // existed must gain its default rather than leave it undefined.
       semantic: { ...DEFAULTS.semantic, ...(saved.semantic || {}) },
+      context: { ...DEFAULTS.context, ...(saved.context || {}) },
       customModels: saved.customModels || [],
       hiddenModels: saved.hiddenModels || [],
     };

@@ -1,8 +1,18 @@
 import { SettingsStore } from '../settings';
-import { fallbackChain, displayName, isToolCapable, get as catalogGet } from '../catalog';
+import { fallbackChain, get as catalogGet } from '../catalog';
 import { ChatStreamEvent } from '../types';
 import { systemPrompt } from './persona';
-import { toolSchemas, dispatch, ToolContext } from './tools';
+import { ToolContext } from './tools';
+import {
+  TokenEstimatorFactory,
+  DefaultPriorityResolver,
+  ConversationSummarizer,
+  createContextManager,
+  getCapabilities,
+} from './context';
+import type { InternalSummaryMsg } from './context/InternalSummaryMsg';
+import { RequestPipeline } from './RequestPipeline';
+
 
 /**
  * The agent loop — ported from backend/brain/openai_brain.py and resilient.py.
@@ -57,12 +67,6 @@ export interface ChatOptions {
 /** Nothing to call with — the settings modal has no usable provider yet. */
 export class NoCredentialsError extends Error {}
 
-/** A provider-side failure, carrying whether the round had already emitted. */
-class ProviderError extends Error {
-  constructor(message: string, readonly status: number | undefined, readonly emitted: boolean) {
-    super(message);
-  }
-}
 
 interface Candidate {
   providerId: string;
@@ -72,12 +76,6 @@ interface Candidate {
   model: string;
 }
 
-interface RoundResult {
-  content: string;
-  toolCalls: Array<{ id: string; name: string; args: string }>;
-  finishReason: string | null;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
-}
 
 /** Absolute ceiling on turns kept, independent of the token budget. */
 const MAX_HISTORY_TURNS = 40;
@@ -87,11 +85,6 @@ const MAX_HISTORY_TURNS = 40;
  */
 const HISTORY_BUDGET_FRACTION = 0.6;
 
-/**
- * Stop before the prompt actually hits the window, so the turn ends with a
- * summary we asked for rather than a provider error we didn't.
- */
-const CONTEXT_STOP_FRACTION = 0.85;
 
 /**
  * Identical consecutive tool calls mean the model is stuck, not working. Three
@@ -134,39 +127,15 @@ function callSignature(calls: Array<{ name: string; args: string }>): string {
   return calls.map(c => `${c.name}:${c.args}`).sort().join('|');
 }
 
+/**
+ * Stop before the prompt actually hits the window, so the turn ends with a
+ * summary we asked for rather than a provider error we didn't.
+ */
+const CONTEXT_STOP_FRACTION = 0.85;
+
 /** Exported for the self-check only. */
 export const _internals = { callSignature, MAX_REPEATED_CALLS, CONTEXT_STOP_FRACTION, FINALIZE_PROMPT };
 
-/**
- * A status worth trying somewhere else: bad/expired key, rate limit, model not
- * present on this endpoint, or a provider-side fault. Anything else (a malformed
- * request) would fail identically everywhere, so it surfaces immediately.
- */
-function isRetriable(status: number | undefined): boolean {
-  if (status === undefined) {
-    return true; // network error or timeout
-  }
-  return [401, 403, 404, 408, 409, 429].includes(status) || status >= 500;
-}
-
-function friendlyMessage(status: number | undefined, detail: string): string {
-  if (status === 401 || status === 403) {
-    return 'The AI service rejected the API key. Check it in Settings → Providers.';
-  }
-  if (status === 429) {
-    return 'The AI service is rate-limiting requests. Wait a few seconds, or add a fallback key in Settings.';
-  }
-  if (status === 404) {
-    return 'That model is not available on this provider. Pick another in Settings → Models.';
-  }
-  if (status !== undefined && status >= 500) {
-    return `The AI service returned an error (${status}). Please try again in a moment.`;
-  }
-  if (status === undefined) {
-    return `I couldn't reach the AI service. Check your connection. (${detail})`;
-  }
-  return `The AI service returned an error (${status}): ${detail}`;
-}
 
 export class Engine {
   constructor(private readonly settings: SettingsStore) {}
@@ -244,8 +213,6 @@ export class Engine {
     const skills = opts.skills || [];
     const system = opts.systemOverride ?? systemPrompt(opts.workspaceRoot, skills, opts.planMode);
     if (skills.length > 0) {
-      // Say which skills are shaping this answer — silent behaviour changes are
-      // impossible to debug when a reply comes out unexpectedly different.
       opts.onEvent({
         type: 'notice',
         text: 'Using skill' + (skills.length > 1 ? 's' : '') + ': ' +
@@ -255,112 +222,140 @@ export class Engine {
           }).join(', '),
       });
     }
-    opts.history.push({ role: 'user', content: opts.userText });
 
-    // A turn is several rounds: sum what we generated, and take the last round's
-    // prompt size as "what the context currently costs".
+    // ── Context Manager setup ─────────────────────────────────────────────────
+    const activeModel = opts.modelOverride || settings.activeModel;
+    const estimator = TokenEstimatorFactory(activeModel);
+    const caps = getCapabilities(activeModel, settings.maxContextTokens);
+    const resolver = new DefaultPriorityResolver();
+
+    // Per-session summarizer: tracks lastSummarizedIndex across rounds.
+    const pipeline = new RequestPipeline({
+      candidates,
+      toolContext: ctx,
+      settings: {
+        temperature: opts.temperature ?? settings.temperature,
+        maxTokens: opts.maxTokens ?? settings.maxTokens,
+        toolGroups: settings.toolGroups,
+        maxToolRounds: settings.maxToolRounds,
+        isTrusted: opts.isTrusted,
+        planMode: opts.planMode,
+      },
+      toolFilter: opts.toolFilter,
+      dispatchOverride: opts.dispatchOverride,
+    });
+
+    const summarizer = new ConversationSummarizer(pipeline, estimator);
+    const manager = createContextManager(
+      settings.context,
+      caps,
+      estimator,
+      resolver,
+      summarizer,
+      [],  // ContextSource array — semantic source wired up in a later PR
+    );
+
+    // Summary messages accumulated across all rounds of this turn.
+    const sessionSummaries: InternalSummaryMsg[] = [];
+
+    // ── Multi-round agent loop ────────────────────────────────────────────────
+    const maxRounds = Math.max(1, settings.maxToolRounds || 100);
+    let lastSignature = '';
+    let repeats = 0;
     let completionTokens = 0;
     let promptTokens = 0;
     let sawRealUsage = false;
 
-    const reportUsage = (messages: Msg[]) => {
-      if (!sawRealUsage) {
-        promptTokens =
-          estimateTokens({ content: system }) + messages.reduce((n, m) => n + estimateTokens(m), 0);
-      }
+    const reportUsage = (usedPrompt: number, usedCompletion: number, estimated: boolean) => {
       opts.onEvent({
         type: 'usage',
         usage: {
-          promptTokens,
-          completionTokens,
-          contextLimit: settings.maxContextTokens,
-          estimated: !sawRealUsage,
+          promptTokens: usedPrompt,
+          completionTokens: usedCompletion,
+          contextLimit: caps.contextWindow,
+          estimated,
         },
       });
     };
 
-    const maxRounds = Math.max(1, settings.maxToolRounds || 100);
-    const contextCeiling = settings.maxContextTokens * CONTEXT_STOP_FRACTION;
-    let lastSignature = '';
-    let repeats = 0;
-
     for (let round = 0; round < maxRounds; round++) {
-      const messages = [{ role: 'system', content: system }, ...opts.history];
+      // ── Build optimized context ──────────────────────────────────────────
+      const optimized = await manager.prepare(
+        opts.history,
+        system,
+        opts.userText,
+        sessionSummaries,
+        opts.signal,
+      );
 
-      // Stop on the resource that actually runs out. Checked before the call so
-      // we end with our own summary rather than a provider 400.
-      const promptEstimate =
-        estimateTokens({ content: system }) + opts.history.reduce((n, m) => n + estimateTokens(m), 0);
-      if (round > 0 && promptEstimate > contextCeiling) {
-        return await this.finalize('context', candidates, settings, opts, system, reportUsage);
-      }
+      // Emit context metrics so the UI can update its panel.
+      opts.onEvent({ type: 'context_metrics', metrics: optimized.metrics });
 
-      const { result, used } = await this.runWithFailover(candidates, messages, settings, opts);
-
-      if (result.usage) {
-        sawRealUsage = true;
-        completionTokens += result.usage.completion_tokens || 0;
-        promptTokens = result.usage.prompt_tokens || promptTokens;
-      }
-
-      if (result.finishReason === 'length') {
-        opts.history.push({ role: 'assistant', content: result.content });
-        opts.history.push({
-          role: 'user',
-          content: 'Your previous response hit the output token limit mid-way. Please continue directly from where you stopped without repeating yourself.',
-        });
+      // Emit compaction notice if something was actually removed.
+      if (optimized.metrics.compactionOccurred) {
+        const { compressionSaved, summarizedTokens, aggressiveSaved } = optimized.metrics;
         opts.onEvent({
-          type: 'notice',
-          text: 'Response hit max tokens — automatically continuing response...',
+          type: 'compaction',
+          saved: compressionSaved,
+          summarized: summarizedTokens,
+          compressed: aggressiveSaved,
         });
-        continue;
+        if (compressionSaved + summarizedTokens + aggressiveSaved > 0) {
+          opts.onEvent({
+            type: 'notice',
+            text: `Context optimized: ${compressionSaved + summarizedTokens + aggressiveSaved} tokens freed` +
+              (summarizedTokens > 0 ? ` (${summarizedTokens} summarized)` : '') + '.',
+          });
+        }
       }
 
-      if (result.finishReason === 'tool_calls' && result.toolCalls.length > 0) {
-        // A model that asks for the identical thing over and over is stuck, and
-        // will stay stuck for every remaining round. Cut it off early.
-        const signature = callSignature(result.toolCalls);
-        repeats = signature === lastSignature ? repeats + 1 : 0;
-        lastSignature = signature;
-        if (repeats >= MAX_REPEATED_CALLS - 1) {
-          return await this.finalize('loop', candidates, settings, opts, system, reportUsage);
-        }
+      // Merge new summaries produced this round into the running list.
+      sessionSummaries.push(...optimized.newSummaries);
 
-        opts.history.push({
-          role: 'assistant',
-          content: result.content,
-          tool_calls: result.toolCalls.map(tc => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.name, arguments: tc.args },
-          })),
-        });
-
-        for (const call of result.toolCalls) {
-          let args: any = {};
-          try {
-            args = JSON.parse(call.args || '{}');
-          } catch {
-            args = {};
-          }
-          opts.onEvent({ type: 'tool_call', name: call.name, input: args });
-          const output = opts.toolFilter && !opts.toolFilter(call.name)
-            ? `The tool '${call.name}' is not available on this turn.`
-            : await (opts.dispatchOverride || dispatch)(call.name, args, ctx);
-          opts.onEvent({ type: 'tool_result', name: call.name, result: output });
-          opts.history.push({ role: 'tool', tool_call_id: call.id, content: output });
-        }
-        continue; // let the model use the results
+      // Warn tier: context over-full, emit notice and attempt finalization.
+      if (optimized.metrics.compactionTier === 'warn') {
+        return await this.finalize('context', candidates, settings, opts, system, promptTokens, completionTokens, sawRealUsage, caps.contextWindow);
       }
 
-      opts.history.push({ role: 'assistant', content: result.content });
-      reportUsage(messages);
+      // ── Execute one pipeline round ───────────────────────────────────────
+      const pipelineResult = await pipeline.execute(optimized.messages, {
+        signal: opts.signal,
+        onEvent: opts.onEvent,
+        suppressTools: false,
+        maxContinuations: 3,
+      });
+
+      if (pipelineResult.usage) {
+        sawRealUsage = true;
+        completionTokens += pipelineResult.usage.completion_tokens || 0;
+        promptTokens = pipelineResult.usage.prompt_tokens || promptTokens;
+      } else if (!sawRealUsage) {
+        promptTokens = optimized.metrics.currentUsage;
+      }
+
+      reportUsage(promptTokens, completionTokens, !sawRealUsage);
+
+      // Loop detected by pipeline.
+      if (pipelineResult.finishReason === 'loop_detected') {
+        // Append what was emitted before the loop was detected.
+        opts.history.push({ role: 'assistant', content: pipelineResult.content });
+        return await this.finalize('loop', candidates, settings, opts, system, promptTokens, completionTokens, sawRealUsage, caps.contextWindow);
+      }
+
+      // Rounds exhausted — pipeline returned after maxToolRounds.
+      if (pipelineResult.toolRounds >= settings.maxToolRounds && pipelineResult.finishReason !== 'stop') {
+        opts.history.push({ role: 'assistant', content: pipelineResult.content });
+        return await this.finalize('rounds', candidates, settings, opts, system, promptTokens, completionTokens, sawRealUsage, caps.contextWindow);
+      }
+
+      // Normal stop — record the turn and return.
+      opts.history.push({ role: 'user', content: opts.userText });
+      opts.history.push({ role: 'assistant', content: pipelineResult.content });
       trimHistory(opts.history, settings.maxContextTokens);
-      void used;
-      return result.content;
+      return pipelineResult.content;
     }
 
-    return await this.finalize('rounds', candidates, settings, opts, system, reportUsage);
+    return await this.finalize('rounds', candidates, settings, opts, system, promptTokens, completionTokens, sawRealUsage, caps.contextWindow);
   }
 
   /**
@@ -375,7 +370,10 @@ export class Engine {
     settings: ReturnType<SettingsStore['get']>,
     opts: ChatOptions,
     system: string,
-    reportUsage: (messages: Msg[]) => void
+    promptTokens: number,
+    completionTokens: number,
+    sawRealUsage: boolean,
+    contextLimit: number,
   ): Promise<string> {
     opts.onEvent({ type: 'notice', text: STOP_NOTICE[reason] });
 
@@ -386,15 +384,34 @@ export class Engine {
       { role: 'user', content: FINALIZE_PROMPT[reason] },
     ];
 
+    const pipeline = new RequestPipeline({
+      candidates,
+      toolContext: {
+        workspaceRoot: opts.workspaceRoot,
+        logDir: opts.logDir,
+        isTrusted: opts.isTrusted,
+      },
+      settings: {
+        temperature: settings.temperature,
+        maxTokens: settings.maxTokens,
+        toolGroups: settings.toolGroups,
+        maxToolRounds: 1,
+      },
+    });
+
     let summary: string;
     try {
-      const { result } = await this.runWithFailover(candidates, messages, settings, opts, true);
+      const result = await pipeline.execute(messages, {
+        signal: opts.signal,
+        onEvent: opts.onEvent,
+        suppressTools: true,
+        maxContinuations: 0,
+      });
       summary = result.content.trim();
     } catch {
       summary = '';
     }
     if (!summary) {
-      // Even the summary call failed — say what happened rather than nothing.
       summary =
         reason === 'loop'
           ? 'I got stuck repeating the same step and stopped. Check the tool results above for what was done.'
@@ -402,249 +419,17 @@ export class Engine {
     }
 
     opts.history.push({ role: 'assistant', content: summary });
-    reportUsage([{ role: 'system', content: system }, ...opts.history]);
+    opts.onEvent({
+      type: 'usage',
+      usage: {
+        promptTokens,
+        completionTokens,
+        contextLimit,
+        estimated: !sawRealUsage,
+      },
+    });
     trimHistory(opts.history, settings.maxContextTokens);
     return summary;
-  }
-
-  /** Run one round, walking the candidate list on a retriable pre-emission failure. */
-  private async runWithFailover(
-    candidates: Candidate[],
-    messages: Msg[],
-    settings: ReturnType<SettingsStore['get']>,
-    opts: ChatOptions,
-    suppressTools = false
-  ): Promise<{ result: RoundResult; used: Candidate }> {
-    let lastError: Error | undefined;
-
-    for (const candidate of candidates) {
-      if (opts.signal.aborted) {
-        throw new Error('Aborted');
-      }
-      try {
-        const result = await this.streamOne(candidate, messages, settings, opts, suppressTools);
-        return { result, used: candidate };
-      } catch (err: any) {
-        lastError = err;
-        if (opts.signal.aborted) {
-          throw err;
-        }
-
-        // Mid-output failure: the user already saw part of the response, so a
-        // retry would append a second attempt after the broken one. Fail fast.
-        if (err instanceof ProviderError && err.emitted) {
-          throw err;
-        }
-
-        const status = err instanceof ProviderError ? err.status : undefined;
-        if (!isRetriable(status)) {
-          // A 400 parameter mismatch will fail on every candidate — don't waste
-          // time walking the rest of the list.
-          throw err;
-        }
-
-        const next = candidates[candidates.indexOf(candidate) + 1];
-        if (next) {
-          opts.onEvent({ type: 'notice', text: failoverNotice(candidate, next, status) });
-        }
-      }
-    }
-
-    const status = lastError instanceof ProviderError ? lastError.status : undefined;
-    throw new Error(friendlyMessage(status, lastError?.message || 'unknown error'));
-  }
-
-  private async streamOne(
-    candidate: Candidate,
-    messages: Msg[],
-    settings: ReturnType<SettingsStore['get']>,
-    opts: ChatOptions,
-    suppressTools: boolean
-  ): Promise<RoundResult> {
-    const body: any = {
-      model: candidate.model,
-      messages,
-      temperature: opts.temperature ?? settings.temperature,
-      max_tokens: opts.maxTokens ?? settings.maxTokens,
-      stream: true,
-      // Ask for the usage record in the final chunk. Providers that don't know
-      // this option ignore it; those that do give us real token counts.
-      stream_options: { include_usage: true },
-    };
-    // A pure-chat model rejects the `tools` param outright, so omit it there.
-    // Withholding tools is also how the wrap-up round is stopped from starting
-    // the work over: it cannot call what it is not given.
-    if (!suppressTools && isToolCapable(candidate.model)) {
-      let tools = toolSchemas(settings.toolGroups, opts.isTrusted, opts.planMode);
-      if (opts.toolFilter) {
-        // Withholding the schema is the real gate for a brain's tool policy;
-        // the dispatch check above only catches a model calling what it was
-        // never offered.
-        const keep = opts.toolFilter;
-        tools = tools.filter((t: any) => keep(t.function?.name));
-      }
-      if (tools.length > 0) {
-        body.tools = tools;
-      }
-    }
-
-    let res: Response;
-    const timeoutController = new AbortController();
-    const timeoutId = setTimeout(() => timeoutController.abort(), 120_000);
-    const combinedSignal = opts.signal ? AbortSignal.any([opts.signal, timeoutController.signal]) : timeoutController.signal;
-
-    try {
-      res = await fetch(`${candidate.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${candidate.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: combinedSignal,
-      });
-    } catch (e: any) {
-      clearTimeout(timeoutId);
-      if (opts.signal?.aborted) {
-        throw e;
-      }
-      if (timeoutController.signal.aborted) {
-        throw new ProviderError('Request timed out after 120 seconds.', 408, false);
-      }
-      throw new ProviderError(e?.message || 'network error', undefined, false);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    if (!res.ok) {
-      const detail = (await res.text().catch(() => '')).slice(0, 300);
-      throw new ProviderError(detail || res.statusText, res.status, false);
-    }
-    if (!res.body) {
-      throw new ProviderError('empty response body', undefined, false);
-    }
-
-    const content: string[] = [];
-    const acc = new Map<number, { id: string; name: string; args: string }>();
-    let finishReason: string | null = null;
-    let emitted = false;
-    let usage: RoundResult['usage'];
-
-    try {
-      for await (const chunk of sseEvents(res.body, opts.signal)) {
-        // The usage record rides in a final chunk that carries no choices, so it
-        // has to be read before the choices guard below.
-        if (chunk?.usage) {
-          usage = chunk.usage;
-        }
-        const choice = chunk?.choices?.[0];
-        if (!choice) {
-          continue;
-        }
-        if (choice.finish_reason) {
-          finishReason = choice.finish_reason;
-        }
-        const delta = choice.delta || {};
-
-        // Reasoning models stream private thinking separately; it is shown in the
-        // thinking panel but is NOT part of the reply.
-        if (delta.reasoning_content) {
-          emitted = true;
-          opts.onEvent({ type: 'reasoning', text: delta.reasoning_content });
-        }
-        if (delta.content) {
-          emitted = true;
-          content.push(delta.content);
-          opts.onEvent({ type: 'token', text: delta.content });
-        }
-        if (delta.tool_calls) {
-          emitted = true;
-          for (let i = 0; i < delta.tool_calls.length; i++) {
-            const tc = delta.tool_calls[i];
-            const index = tc.index ?? i;
-            const slot = acc.get(index) || { id: '', name: '', args: '' };
-            if (tc.id) {
-              slot.id = tc.id;
-            }
-            if (tc.function?.name) {
-              slot.name += tc.function.name;
-            }
-            if (tc.function?.arguments) {
-              slot.args += tc.function.arguments;
-            }
-            acc.set(index, slot);
-          }
-        }
-      }
-    } catch (e: any) {
-      if (opts.signal.aborted) {
-        throw e;
-      }
-      throw new ProviderError(e?.message || 'stream failed', undefined, emitted);
-    }
-
-    const toolCalls = [...acc.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
-    // Some providers stream tool calls without ever setting finish_reason.
-    if (!finishReason && toolCalls.length > 0) {
-      finishReason = 'tool_calls';
-    }
-
-    return { content: content.join(''), toolCalls, finishReason, usage };
-  }
-}
-
-function failoverNotice(from: Candidate, to: Candidate, status: number | undefined): string {
-  const why =
-    status === 429 ? 'rate-limited'
-    : status === 401 || status === 403 ? 'rejected the key'
-    : status === 404 ? "doesn't have that model"
-    : 'unavailable';
-
-  if (from.model !== to.model) {
-    return `${displayName(from.model)} ${why} — retrying on ${displayName(to.model)}.`;
-  }
-  if (from.providerId !== to.providerId) {
-    return `${from.providerName} ${why} — retrying on ${to.providerName}.`;
-  }
-  return `${from.providerName} ${why} — retrying with the next key.`;
-}
-
-/** Parse an OpenAI-style `data:` SSE stream into JSON objects. */
-async function* sseEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<any> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-  try {
-    while (true) {
-      if (signal.aborted) {
-        return;
-      }
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line.startsWith('data:')) {
-          continue; // comment, event name, or keepalive
-        }
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') {
-          return;
-        }
-        try {
-          yield JSON.parse(payload);
-        } catch {
-          // A partial or non-JSON frame; the next chunk usually completes it.
-        }
-      }
-    }
-  } finally {
-    await reader.cancel().catch(() => undefined);
   }
 }
 
