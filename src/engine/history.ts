@@ -53,7 +53,7 @@ export function rebuildEngineHistory(messages: ChatMessage[]): Msg[] {
         continue;
       }
 
-      const id = `call_${++callCounter}`;
+      const id = `call${String(++callCounter).padStart(5, '0')}`;
       history.push({
         role: 'assistant',
         content: pending,

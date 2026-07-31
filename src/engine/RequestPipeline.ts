@@ -54,6 +54,58 @@ function callSignature(calls: Array<{ name: string; args: string }>): string {
   return calls.map(c => `${c.name}:${c.args}`).sort().join('|');
 }
 
+/**
+ * Sanitize or generate a tool call ID that satisfies strict provider regexes
+ * (e.g. Anthropic / Claude endpoints requiring a-z, A-Z, 0-9 of length 9).
+ */
+export function sanitizeToolCallId(id: string | undefined, index: number): string {
+  if (id && /^[a-zA-Z0-9]{9}$/.test(id)) {
+    return id;
+  }
+  const clean = (id || '').replace(/[^a-zA-Z0-9]/g, '');
+  if (clean.length === 9) {
+    return clean;
+  }
+  if (clean.length > 9) {
+    return clean.slice(0, 9);
+  }
+  if (clean.length > 0) {
+    return (clean + '000000000').slice(0, 9);
+  }
+  return `call${String(index + 1).padStart(5, '0')}`;
+}
+
+/**
+ * Ensure all messages in history have valid 9-character alphanumeric tool call IDs,
+ * keeping assistant.tool_calls[].id and tool.tool_call_id pairs matched.
+ */
+export function ensureValidToolCallIds(messages: Msg[]): void {
+  const map = new Map<string, string>();
+  let counter = 0;
+
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      for (const call of msg.tool_calls) {
+        if (call && call.id) {
+          const oldId = String(call.id);
+          if (!/^[a-zA-Z0-9]{9}$/.test(oldId)) {
+            const newId = map.get(oldId) ?? sanitizeToolCallId(oldId, counter++);
+            map.set(oldId, newId);
+            call.id = newId;
+          }
+        }
+      }
+    } else if (msg.role === 'tool' && msg.tool_call_id) {
+      const oldId = String(msg.tool_call_id);
+      if (!/^[a-zA-Z0-9]{9}$/.test(oldId)) {
+        const newId = map.get(oldId) ?? sanitizeToolCallId(oldId, counter++);
+        map.set(oldId, newId);
+        msg.tool_call_id = newId;
+      }
+    }
+  }
+}
+
 function isRetriable(status: number | undefined): boolean {
   if (status === undefined) {
     return true;
@@ -225,6 +277,11 @@ export class RequestPipeline implements IRequestPipeline, ILLMService {
           break;
         }
 
+        // Ensure valid tool call IDs (9-char alphanumeric) for all tool calls
+        result.toolCalls.forEach((tc, idx) => {
+          tc.id = sanitizeToolCallId(tc.id, idx);
+        });
+
         messages.push({
           role: 'assistant',
           content: result.content,
@@ -351,6 +408,8 @@ export class RequestPipeline implements IRequestPipeline, ILLMService {
         body.tools = tools;
       }
     }
+
+    ensureValidToolCallIds(messages);
 
     let res: Response;
     const timeoutController = new AbortController();
