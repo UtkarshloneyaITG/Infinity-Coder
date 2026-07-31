@@ -121,10 +121,11 @@ Everything else:
 - **Key & model failover** — add fallback keys per provider. A key that hits 401 or 429
   falls through to the next key, then the next provider, then a lighter model, with a
   notice in the chat each time.
-- **Token usage** — real counts from the provider plus a context-budget meter per reply.
-- **Live activity strip** — what the agent is doing right now, elapsed time, Stop button.
-- **Editor integration** — right-click a selection for *Explain*, *Fix / Refactor*, or
-  *Ask about this*.
+- **Adaptive Context Manager v2** — Automatic 5-tier context compaction (`none`, `tool`, `summarize`, `aggressive`, `warn`) driven by exact model capabilities (128k, 32k, etc.). Deep history turns are auto-summarized without losing facts, and large tool outputs are compacted so conversations stay coherent over long sessions.
+- **Delete / Clear Chat** — Easily clear your session using the header Trash button, delete individual saved chats from the History menu, or type `/clear`.
+- **Unified Request Pipeline** — Automatic response continuation when output hits max tokens, retries on retriable provider errors, and loop detection for stuck tool steps.
+- **Semantic RAG ContextSource** — Pluggable vector context source integrated into the prompt pipeline with real-time token tracking.
+- **Editor integration** — right-click a selection for *Explain*, *Fix / Refactor*, or *Ask about this*.
 
 Keyboard: `Ctrl+Alt+B` (`Cmd+Alt+B` on macOS) opens the chat.
 
@@ -234,14 +235,17 @@ path is an approximate index behind the same `VectorStore` interface, not a bigg
 npm test
 ```
 
-Four assert-based self-checks, no framework:
+Seven assert-based self-checks, no framework:
 
 | Suite | Covers |
 |---|---|
 | `settings.test.ts` | Key storage, failover ordering, secrets never reaching globalState |
+| `semantic/semantic.test.ts` | AST chunking, vector storage, cosine similarity & hybrid search ranking |
+| `engine/context/context.test.ts` | Adaptive Context Manager: estimators, priority classification, budget calculation, compaction tiers, summarizer & prompt builder |
 | `engine/engine.test.ts` | Tools against a temp dir, path handling, the SSRF guard, HTML extraction, history trimming |
 | `engine/skills.test.ts` | Frontmatter parsing, discovery, keyword scoring, mode/command precedence |
 | `webview.test.ts` | Generated HTML: CSP and nonces, no remote resources, script parses, approval-card behaviour |
+| `brains/orchestration.test.ts` | Multi-brain team orchestration: DAG scheduling, consensus voting, memory isolation & conflict resolution |
 
 ## Requirements
 
